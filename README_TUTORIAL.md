@@ -1,4 +1,4 @@
-# README_RUN_FROM_SCRATCH.md
+# README_TUTORIAL.md
 
 # Hướng dẫn chạy project từ đầu sau khi pull/clone repo
 
