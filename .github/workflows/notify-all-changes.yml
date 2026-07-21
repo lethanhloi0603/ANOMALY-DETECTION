@@ -1,0 +1,490 @@
+name: Notify all repository changes
+
+run-name: Notify ${{ github.event_name }} by ${{ github.actor }}
+
+on:
+  # Mọi commit/push lên mọi branch
+  push:
+
+  # Mọi thay đổi liên quan đến Pull Request
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+      - ready_for_review
+      - converted_to_draft
+      - closed
+
+  # Tạo branch hoặc tag
+  create:
+
+  # Xóa branch hoặc tag
+  delete:
+
+  # Hoạt động liên quan đến Issue
+  issues:
+    types:
+      - opened
+      - edited
+      - closed
+      - reopened
+      - assigned
+      - unassigned
+      - labeled
+      - unlabeled
+
+  # Bình luận trong Issue hoặc Pull Request
+  issue_comment:
+    types:
+      - created
+      - edited
+      - deleted
+
+  # Review Pull Request
+  pull_request_review:
+    types:
+      - submitted
+      - edited
+      - dismissed
+
+  # Bình luận trực tiếp vào dòng code trong Pull Request
+  pull_request_review_comment:
+    types:
+      - created
+      - edited
+      - deleted
+
+  # Hoạt động liên quan đến Release
+  release:
+    types:
+      - created
+      - edited
+      - published
+      - unpublished
+      - deleted
+      - prereleased
+      - released
+
+  # Cho phép chạy thử thủ công
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  send-email:
+    name: Send repository notification
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send formatted notification email
+        env:
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+
+          # Hai email nhận thông báo
+          MAIL_TO: >-
+            lethanhloi0603@gmail.com,
+            thainguyenvuquang@gmail.com
+
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          SERVER_URL: ${{ github.server_url }}
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import smtplib
+          from datetime import datetime, timezone
+          from email.message import EmailMessage
+
+
+          def shorten(value, max_length=1500):
+              """Convert a value to text and limit email length."""
+              if value is None:
+                  return "(Không có)"
+
+              value = str(value).strip()
+
+              if not value:
+                  return "(Không có)"
+
+              if len(value) > max_length:
+                  return value[:max_length] + "\n...[Nội dung đã được rút gọn]"
+
+              return value
+
+
+          def add_detail(lines, label, value):
+              """Add a consistently formatted field."""
+              lines.append(f"{label}: {shorten(value)}")
+
+
+          event_path = os.environ["GITHUB_EVENT_PATH"]
+
+          with open(event_path, "r", encoding="utf-8") as file:
+              event = json.load(file)
+
+          repository = os.environ["REPOSITORY"]
+          event_name = os.environ["EVENT_NAME"]
+          actor = os.environ["ACTOR"]
+          server_url = os.environ["SERVER_URL"]
+          run_id = os.environ["RUN_ID"]
+
+          action = event.get("action", "")
+          repository_url = f"{server_url}/{repository}"
+          workflow_url = f"{repository_url}/actions/runs/{run_id}"
+
+          details = []
+          notification_url = repository_url
+          subject_detail = action or event_name
+
+          # ---------------------------------------------------------
+          # PUSH / COMMIT
+          # ---------------------------------------------------------
+          if event_name == "push":
+              branch = event.get("ref", "").replace("refs/heads/", "")
+              commits = event.get("commits", [])
+              compare_url = event.get("compare", repository_url)
+
+              subject_detail = f"PUSH {branch}"
+
+              add_detail(details, "Nhánh", branch)
+              add_detail(details, "Số commit trong lần push", len(commits))
+              add_detail(details, "Commit trước", event.get("before"))
+              add_detail(details, "Commit mới", event.get("after"))
+
+              details.append("")
+              details.append("DANH SÁCH COMMIT")
+              details.append("-" * 60)
+
+              if commits:
+                  for index, commit in enumerate(commits, start=1):
+                      commit_id = commit.get("id", "")[:7]
+                      commit_message = commit.get("message", "")
+                      commit_author = commit.get("author", {}).get("name", "")
+                      commit_url = commit.get("url", "")
+
+                      details.append(
+                          f"{index}. [{commit_id}] {commit_message}"
+                      )
+                      details.append(f"   Tác giả: {commit_author}")
+                      details.append(f"   Link: {commit_url}")
+              else:
+                  details.append("(Không tìm thấy danh sách commit trong payload)")
+
+              notification_url = compare_url
+
+          # ---------------------------------------------------------
+          # PULL REQUEST
+          # ---------------------------------------------------------
+          elif event_name == "pull_request":
+              pull_request = event.get("pull_request", {})
+
+              number = event.get("number")
+              title = pull_request.get("title")
+              head_branch = pull_request.get("head", {}).get("ref")
+              base_branch = pull_request.get("base", {}).get("ref")
+              merged = pull_request.get("merged", False)
+              body = pull_request.get("body")
+
+              subject_detail = f"PR #{number} {action}"
+
+              add_detail(details, "Pull Request", f"#{number}")
+              add_detail(details, "Hành động", action)
+              add_detail(details, "Tiêu đề", title)
+              add_detail(details, "Nhánh nguồn", head_branch)
+              add_detail(details, "Nhánh đích", base_branch)
+              add_detail(details, "Đã merge", "Có" if merged else "Không")
+              add_detail(
+                  details,
+                  "Người tạo",
+                  pull_request.get("user", {}).get("login"),
+              )
+
+              details.append("")
+              details.append("MÔ TẢ PULL REQUEST")
+              details.append("-" * 60)
+              details.append(shorten(body, 3000))
+
+              notification_url = pull_request.get(
+                  "html_url",
+                  repository_url,
+              )
+
+          # ---------------------------------------------------------
+          # ISSUE
+          # ---------------------------------------------------------
+          elif event_name == "issues":
+              issue = event.get("issue", {})
+
+              number = issue.get("number")
+              title = issue.get("title")
+
+              subject_detail = f"ISSUE #{number} {action}"
+
+              add_detail(details, "Issue", f"#{number}")
+              add_detail(details, "Hành động", action)
+              add_detail(details, "Tiêu đề", title)
+              add_detail(
+                  details,
+                  "Người tạo",
+                  issue.get("user", {}).get("login"),
+              )
+              add_detail(details, "Trạng thái", issue.get("state"))
+
+              details.append("")
+              details.append("NỘI DUNG ISSUE")
+              details.append("-" * 60)
+              details.append(shorten(issue.get("body"), 3000))
+
+              notification_url = issue.get("html_url", repository_url)
+
+          # ---------------------------------------------------------
+          # ISSUE / PR COMMENT
+          # ---------------------------------------------------------
+          elif event_name == "issue_comment":
+              issue = event.get("issue", {})
+              comment = event.get("comment", {})
+
+              number = issue.get("number")
+              is_pull_request = "pull_request" in issue
+              item_type = "PR" if is_pull_request else "ISSUE"
+
+              subject_detail = f"{item_type} COMMENT #{number} {action}"
+
+              add_detail(details, "Loại", item_type)
+              add_detail(details, "Số", f"#{number}")
+              add_detail(details, "Hành động", action)
+              add_detail(details, "Tiêu đề", issue.get("title"))
+              add_detail(
+                  details,
+                  "Người bình luận",
+                  comment.get("user", {}).get("login"),
+              )
+
+              details.append("")
+              details.append("NỘI DUNG BÌNH LUẬN")
+              details.append("-" * 60)
+              details.append(shorten(comment.get("body"), 3000))
+
+              notification_url = comment.get(
+                  "html_url",
+                  issue.get("html_url", repository_url),
+              )
+
+          # ---------------------------------------------------------
+          # PULL REQUEST REVIEW
+          # ---------------------------------------------------------
+          elif event_name == "pull_request_review":
+              pull_request = event.get("pull_request", {})
+              review = event.get("review", {})
+
+              number = pull_request.get("number")
+
+              subject_detail = f"PR REVIEW #{number} {action}"
+
+              add_detail(details, "Pull Request", f"#{number}")
+              add_detail(details, "Tiêu đề", pull_request.get("title"))
+              add_detail(details, "Hành động", action)
+              add_detail(details, "Trạng thái review", review.get("state"))
+              add_detail(
+                  details,
+                  "Người review",
+                  review.get("user", {}).get("login"),
+              )
+
+              details.append("")
+              details.append("NỘI DUNG REVIEW")
+              details.append("-" * 60)
+              details.append(shorten(review.get("body"), 3000))
+
+              notification_url = review.get(
+                  "html_url",
+                  pull_request.get("html_url", repository_url),
+              )
+
+          # ---------------------------------------------------------
+          # REVIEW COMMENT TRÊN CODE
+          # ---------------------------------------------------------
+          elif event_name == "pull_request_review_comment":
+              pull_request = event.get("pull_request", {})
+              comment = event.get("comment", {})
+
+              number = pull_request.get("number")
+
+              subject_detail = f"PR CODE COMMENT #{number} {action}"
+
+              add_detail(details, "Pull Request", f"#{number}")
+              add_detail(details, "Tiêu đề", pull_request.get("title"))
+              add_detail(details, "Hành động", action)
+              add_detail(details, "File", comment.get("path"))
+              add_detail(details, "Dòng code", comment.get("line"))
+              add_detail(
+                  details,
+                  "Người bình luận",
+                  comment.get("user", {}).get("login"),
+              )
+
+              details.append("")
+              details.append("NỘI DUNG BÌNH LUẬN")
+              details.append("-" * 60)
+              details.append(shorten(comment.get("body"), 3000))
+
+              notification_url = comment.get(
+                  "html_url",
+                  pull_request.get("html_url", repository_url),
+              )
+
+          # ---------------------------------------------------------
+          # RELEASE
+          # ---------------------------------------------------------
+          elif event_name == "release":
+              release = event.get("release", {})
+
+              tag_name = release.get("tag_name")
+              release_name = release.get("name")
+
+              subject_detail = f"RELEASE {tag_name} {action}"
+
+              add_detail(details, "Hành động", action)
+              add_detail(details, "Phiên bản", tag_name)
+              add_detail(details, "Tên release", release_name)
+              add_detail(
+                  details,
+                  "Người phát hành",
+                  release.get("author", {}).get("login"),
+              )
+              add_detail(
+                  details,
+                  "Pre-release",
+                  "Có" if release.get("prerelease") else "Không",
+              )
+              add_detail(
+                  details,
+                  "Draft",
+                  "Có" if release.get("draft") else "Không",
+              )
+
+              details.append("")
+              details.append("NỘI DUNG RELEASE")
+              details.append("-" * 60)
+              details.append(shorten(release.get("body"), 4000))
+
+              notification_url = release.get(
+                  "html_url",
+                  repository_url,
+              )
+
+          # ---------------------------------------------------------
+          # TẠO/XÓA BRANCH HOẶC TAG
+          # ---------------------------------------------------------
+          elif event_name in {"create", "delete"}:
+              ref_type = event.get("ref_type")
+              ref_name = event.get("ref")
+
+              subject_detail = (
+                  f"{event_name.upper()} {ref_type} {ref_name}"
+              )
+
+              add_detail(details, "Loại đối tượng", ref_type)
+              add_detail(details, "Tên", ref_name)
+              add_detail(
+                  details,
+                  "Hành động",
+                  "Tạo mới" if event_name == "create" else "Xóa",
+              )
+
+          # ---------------------------------------------------------
+          # CHẠY THỦ CÔNG HOẶC SỰ KIỆN KHÁC
+          # ---------------------------------------------------------
+          else:
+              add_detail(details, "Sự kiện", event_name)
+              add_detail(details, "Hành động", action)
+              add_detail(details, "Commit", os.environ.get("SHA"))
+
+          occurred_at = datetime.now(timezone.utc).strftime(
+              "%Y-%m-%d %H:%M:%S UTC"
+          )
+
+          subject = (
+              f"[GITHUB][{repository}] "
+              f"{subject_detail} - by {actor}"
+          )
+
+          body = f"""
+          THÔNG BÁO THAY ĐỔI TRÊN GITHUB
+
+          Repository: {repository}
+          Loại sự kiện: {event_name}
+          Hành động: {action or "(Không áp dụng)"}
+          Người thực hiện: {actor}
+          Thời gian gửi: {occurred_at}
+
+          CHI TIẾT
+          ============================================================
+          {chr(10).join(details)}
+          ============================================================
+
+          Xem nội dung thay đổi:
+          {notification_url}
+
+          Xem repository:
+          {repository_url}
+
+          Xem lần chạy GitHub Actions:
+          {workflow_url}
+
+          Đây là email được tạo tự động.
+          Vui lòng không trả lời email này.
+          """.strip()
+
+          sender = os.environ["MAIL_USERNAME"]
+          password = os.environ["MAIL_PASSWORD"]
+
+          recipients = [
+              email.strip()
+              for email in os.environ["MAIL_TO"].split(",")
+              if email.strip()
+          ]
+
+          if not sender:
+              raise ValueError("MAIL_USERNAME chưa được cấu hình.")
+
+          if not password:
+              raise ValueError("MAIL_PASSWORD chưa được cấu hình.")
+
+          if not recipients:
+              raise ValueError("Danh sách người nhận đang trống.")
+
+          message = EmailMessage()
+          message["Subject"] = subject
+          message["From"] = f"GitHub Repository Bot <{sender}>"
+          message["To"] = ", ".join(recipients)
+          message.set_content(body)
+
+          with smtplib.SMTP_SSL(
+              "smtp.gmail.com",
+              465,
+              timeout=30,
+          ) as smtp:
+              smtp.login(sender, password)
+              smtp.send_message(
+                  message,
+                  from_addr=sender,
+                  to_addrs=recipients,
+              )
+
+          print(
+              "Đã gửi email tới: "
+              + ", ".join(recipients)
+          )
+          PY
