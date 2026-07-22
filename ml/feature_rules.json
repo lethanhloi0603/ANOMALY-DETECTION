@@ -1,0 +1,51 @@
+{
+  "internal_email_domains": [
+    "dtaa.com"
+  ],
+  "missing_email_domain_is_external": false,
+  "after_hours": {
+    "enabled": false,
+    "start_hour": 8,
+    "end_hour": 18,
+    "include_weekends": false,
+    "reason": "CERT R4.2 documents after-hours behavior but does not publish a fixed organization-wide 08:00-18:00 schedule. Keep this rule disabled unless the experiment declares and validates a schedule."
+  },
+  "job_site_keywords": [
+    "job",
+    "career",
+    "linkedin",
+    "monster"
+  ],
+  "wikileaks_keywords": [
+    "wikileaks"
+  ],
+  "external_storage_keywords": [
+    "dropbox",
+    "drive.google",
+    "mega.nz",
+    "upload"
+  ],
+  "sensitive_file_extensions": [
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".pdf",
+    ".zip",
+    ".7z",
+    ".rar"
+  ],
+  "file_burst": {
+    "user_quantile": 0.9,
+    "minimum_events": 20
+  },
+  "mass_email": {
+    "recipient_weight": 1.0,
+    "bcc_weight": 2.0,
+    "external_weight": 2.0,
+    "token_threshold": 20.0
+  },
+  "max_events_per_day": 256
+}

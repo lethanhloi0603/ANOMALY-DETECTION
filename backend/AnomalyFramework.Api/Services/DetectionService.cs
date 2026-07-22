@@ -66,9 +66,10 @@ public class DetectionService
         var trainingTriggered = false;
         var trainingCompleted = false;
 
-        // Demo rule mới: đủ 30 ngày hoạt động thì bật personalized baseline.
-        // Log hiện tại vẫn được predict bằng route trước khi train; log kế tiếp sẽ dùng personalized.
-        if (allowTraining && !state.IsPersonalizedReady && activeDays >= _settings.PersonalizedActiveDaysThreshold)
+        // Active days are only a cheap pre-check. The Python worker activates or
+        // updates a personal threshold only when enough delayed safe days exist.
+        // The neural model remains global; only the robust personal calibration is updated.
+        if (allowTraining && activeDays >= _settings.PersonalizedActiveDaysThreshold)
         {
             trainingTriggered = true;
             trainingCompleted = await _trainingService.TrainPersonalizedIfEligibleAsync(raw.UserId, activeDays, cancellationToken);

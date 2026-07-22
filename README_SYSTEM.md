@@ -3,13 +3,13 @@
 Dự án này là framework demo phát hiện hành vi bất thường/insider threat trên bộ dữ liệu CERT R4.2. Hệ thống kết hợp ba phần:
 
 1. **Backend ASP.NET Core Web API**: nhận log, lưu SQLite, gọi Python ML worker, expose API/Swagger.
-2. **Python ML pipeline**: chuẩn hóa dữ liệu, tạo count view + sequence view, train Global/Personalized baseline, predict anomaly.
+2. **Python ML pipeline**: chuẩn hóa dữ liệu, tạo count view + raw sequence view, train global model, fit/update safe personalized threshold, predict anomaly.
 3. **Frontend React/Vite**: giao diện demo trực quan flow Global → Role/Department calibration → Personalized baseline.
 
 Framework hiện tại dùng đơn vị phân tích chính là **user-day**: một user trong một ngày. Mỗi user-day được biểu diễn bằng 2 nhánh:
 
 - **Count/statistical view**: đếm số lượng/tần suất/cường độ hành vi trong ngày.
-- **Sequence-derived view**: feature hóa chuỗi/thứ tự event trong ngày.
+- **Raw sequence view**: token/source/time-gap đi qua neural daily sequence encoder để giữ thông tin thứ tự.
 
 Hai nhánh được nén thành vector 128 chiều:
 
@@ -20,7 +20,7 @@ Hai nhánh được nén thành vector 128 chiều:
 Sau đó model tạo window 30 ngày:
 
 ```text
-X_window = 30 ngày × 128 chiều
+X_window = 30 calendar days liên tục × 128 chiều
 ```
 
 Model chính là **TCN-Transformer Autoencoder**. Model học cách reconstruct hành vi bình thường; hành vi nào reconstruct sai nhiều thì reconstruction error cao và được xem là bất thường.
@@ -42,7 +42,7 @@ data/processed/00_unified_event_log.csv
         ↓
 data/processed/01_user_day_features.csv      ← Count/statistical view
         ↓
-data/processed/02_user_day_sequences.jsonl   ← Sequence-derived view
+data/processed/02_user_day_sequences.jsonl   ← Raw token/source/time-gap sequence view
         ↓
 data/processed/03_user_day_multiview.csv     ← Input chính cho global training
         ↓
@@ -55,7 +55,7 @@ models/global/metadata.json
 Backend API + Frontend demo
         ↓
 User mới: Global + Role/Department calibration
-User đủ 30 active days: Personalized baseline
+User đủ lịch sử an toàn: Safe personalized threshold (không train neural model riêng)
 ```
 
 ---
@@ -119,8 +119,8 @@ ANOMALY-DETECTION/
 | `data/cert4.2` | Nơi đặt 5 raw log CERT: `logon.csv`, `device.csv`, `file.csv`, `email.csv`, `http.csv`. Không push folder này lên GitHub. |
 | `data/ldap` | Nơi đặt các file LDAP theo tháng, ví dụ `2010-01.csv`, `2011-05.csv`. Không push data thật nếu nhạy cảm. |
 | `data/processed` | Output sau khi prepare dữ liệu: unified event log, user-day features, sequence, multiview, holdout users. Không push generated files. |
-| `models/global` | Model global baseline đã train: `model.pt`, `vectorizer.joblib`, `metadata.json`, `train_scores.csv`. Không push model binary lên GitHub nếu nặng. |
-| `models/personalized` | Model personalized riêng theo từng user. Tự sinh khi user đủ 30 active days. Không push lên GitHub. |
+| `models/global` | Model global baseline đã train: `model.pt`, `vectorizer.joblib`, `metadata.json`, `all_scores.csv`. Không push model binary lên GitHub nếu nặng. |
+| `models/personalized` | Metadata và score history của safe personalized threshold theo user; không chứa neural model riêng. Không push generated artifacts lên GitHub. |
 
 ---
 
@@ -148,7 +148,7 @@ Các API chính:
 | `GET /api/detections` | Xem lịch sử các lần detect/predict. |
 | `GET /api/dashboard/summary` | Lấy thống kê tổng quan cho dashboard frontend. |
 | `POST /api/training/global` | Train Global Role/Department baseline. |
-| `POST /api/training/personalized/{userId}` | Train personalized model thủ công cho một user. |
+| `POST /api/training/personalized/{userId}` | Kiểm tra/fit safe personalized threshold thủ công cho một user. |
 | `GET /api/demo/holdout-users` | Lấy danh sách user holdout dùng cho demo. |
 | `POST /api/demo/replay` | Replay log của holdout user vào DB theo ngày/event. |
 
@@ -172,11 +172,22 @@ Các field quan trọng:
     "GlobalTrainingMultiviewPath": "../../data/processed/03_user_day_multiview.csv",
     "RoleContextPath": "../../data/processed/role_context.csv",
     "HoldoutDirectory": "../../data/processed/holdout",
+    "FeatureRulesPath": "../../ml/feature_rules.json",
     "PersonalizedActiveDaysThreshold": 30,
     "WindowSize": 30,
     "TrainEpochs": 3,
+    "TrainBatchSize": 32,
+    "LearningRate": 0.0005,
+    "HiddenDimension": 128,
+    "TransformerLayers": 2,
+    "AttentionHeads": 4,
+    "MaxEventsPerDay": 256,
     "AnomalyQuantile": 0.995,
-    "MinRoleSamples": 25,
+    "MinRoleUsers": 30,
+    "MinRoleUserDays": 1000,
+    "PersonalizedSafeHistoryDays": 90,
+    "PersonalizedUpdateDelayDays": 7,
+    "PersonalizedUpdateEverySafeDays": 7,
     "PredictionTimeoutSeconds": 120,
     "TrainingTimeoutSeconds": 900
   }
@@ -192,11 +203,12 @@ Giải thích nhanh:
 | `ModelDirectory` | Folder chứa model global/personalized. |
 | `GlobalTrainingMultiviewPath` | File input chính để train global. |
 | `RoleContextPath` | File role context được sinh ra từ LDAP. |
-| `PersonalizedActiveDaysThreshold` | Số active days tối thiểu để bật personalized, hiện là 30. |
-| `WindowSize` | Số ngày trong một window model, hiện là 30. |
+| `PersonalizedActiveDaysThreshold` | Pre-check rẻ trước khi worker đếm ngày an toàn; không tự động đồng nghĩa personal threshold đã đủ điều kiện. |
+| `WindowSize` | Số calendar days liên tục trong một window model, hiện là 30; ngày trống được zero-fill. |
 | `TrainEpochs` | Số vòng học qua toàn bộ dữ liệu. Demo có thể để 1 để tránh timeout. |
 | `AnomalyQuantile` | Percentile dùng để lấy anomaly threshold, hiện là 99.5%. |
-| `MinRoleSamples` | Role/department cần tối thiểu bao nhiêu samples để tạo threshold riêng. |
+| `MinRoleUsers`, `MinRoleUserDays` | Role/department chỉ có threshold riêng khi đủ ít nhất 30 user hoặc 1.000 validation user-days. |
+| `PersonalizedSafeHistoryDays`, `PersonalizedUpdateDelayDays` | Cửa sổ lịch sử an toàn và độ trễ chống baseline poisoning. |
 | `PredictionTimeoutSeconds` | Timeout khi predict. |
 | `TrainingTimeoutSeconds` | Timeout khi train model từ API. |
 
@@ -275,11 +287,11 @@ Các field chính:
 | `ActiveDaysCount` | Số ngày user có hoạt động. |
 | `Role` | Role hiện tại/role được detect từ LDAP context. |
 | `Department` | Department hiện tại. |
-| `IsPersonalizedReady` | User đã có personalized model hay chưa. |
-| `IsTraining` | User có đang train personalized hay không. |
-| `PersonalizedModelPath` | Đường dẫn model riêng của user. |
-| `LastPersonalizedTrainingAtUtc` | Thời điểm train personalized gần nhất. |
-| `LastTrainingMessage` | Message/log train gần nhất. |
+| `IsPersonalizedReady` | User đã có safe personal threshold active hay chưa. |
+| `IsTraining` | Worker có đang kiểm tra/fit personal threshold hay không. |
+| `PersonalizedModelPath` | Tên cũ của field; hiện trỏ tới thư mục calibration metadata, không phải model riêng. |
+| `LastPersonalizedTrainingAtUtc` | Thời điểm personal threshold được update gần nhất. |
+| `LastTrainingMessage` | Message/log calibration gần nhất. |
 
 ---
 
@@ -307,8 +319,8 @@ Các field chính:
 | `LogCountAtPrediction` | Log count tại thời điểm predict. |
 | `ActiveDaysAtPrediction` | Active days tại thời điểm predict. |
 | `PersonalizedReadyAtPrediction` | Lúc predict user đã có personalized chưa. |
-| `PersonalizedTrainingTriggered` | Có trigger train personalized sau predict không. |
-| `PersonalizedTrainingCompleted` | Train personalized có hoàn tất không. |
+| `PersonalizedTrainingTriggered` | Có trigger kiểm tra safe personalized calibration sau predict không. |
+| `PersonalizedTrainingCompleted` | Personal threshold có được update trong lần kiểm tra đó không. |
 | `ModelVersion` | Version/model metadata từ Python. |
 | `Warning` | Cảnh báo nếu thiếu model, không đủ dữ liệu, v.v. |
 
@@ -478,10 +490,10 @@ Output:
 models/global/model.pt
 models/global/vectorizer.joblib
 models/global/metadata.json
-models/global/train_scores.csv
+models/global/all_scores.csv
 ```
 
-#### 2. Train personalized
+#### 2. Fit/update safe personalized threshold
 
 Gọi script:
 
@@ -492,13 +504,13 @@ ml/train_multiview.py --scope personalized --user-id <USER_ID>
 Input:
 
 - RawLogs của user trong SQLite DB
-- global vectorizer từ `models/global/vectorizer.joblib`
+- global model/vectorizer từ `models/global`
 
 Output:
 
 ```text
-models/personalized/<USER_ID>/model.pt
 models/personalized/<USER_ID>/metadata.json
+models/personalized/<USER_ID>/calibration_scores.csv
 ```
 
 Sau khi train xong, service update `UserModelStates`:
@@ -539,19 +551,19 @@ Lưu vào RawLogs
 ↓
 Đọc UserModelState
 ↓
-Nếu user có personalized model → route personalized
+Nếu user có safe personalized threshold đang active → route personalized
 Nếu chưa có → route global
 ↓
 Gọi PredictionService để predict
 ↓
 Lưu DetectionResult
 ↓
-Nếu user chưa personalized và activeDays >= 30 → trigger TrainPersonalizedIfEligible
+Nếu activeDays qua pre-check → kiểm tra đủ delayed safe days và cadence update
 ↓
 Trả DetectionResponseDto
 ```
 
-Điểm quan trọng: log hiện tại được predict bằng route hiện tại trước. Nếu log đó làm user đủ 30 active days, hệ thống train personalized sau predict; log tiếp theo mới route personalized.
+Điểm quan trọng: log hiện tại được predict bằng route hiện tại trước. Sau đó worker có thể kích hoạt/cập nhật personal threshold nếu đủ ngày an toàn, qua update delay và đến cadence. Neural model vẫn là global model.
 
 ---
 
@@ -623,6 +635,8 @@ Các class chính:
 | `TCNBlock` | Một residual TCN block, dùng Conv1D dilation để học pattern theo thời gian. |
 | `PositionalEncoding` | Thêm thông tin vị trí ngày trong window cho Transformer. |
 | `TCNTransformerAutoencoder` | Model chính: input projection → TCN → Transformer Encoder → decoder reconstruction. |
+| `DaySequenceEncoder` | Học trực tiếp token/source/time-gap/position của event trong ngày, rồi attention-pool về 64 chiều. |
+| `MultiViewTCNTransformerAutoencoder` | Ghép count projection 64 chiều với neural sequence embedding 64 chiều trước temporal AE. |
 
 Input model:
 
@@ -728,7 +742,7 @@ z_file_vs_user_30d
 z_usb_vs_user_30d
 ```
 
-#### 4. Tạo sequence-derived view
+#### 4. Tạo raw sequence view
 
 Hàm:
 
@@ -752,7 +766,7 @@ seq_len
 sequence flags
 ```
 
-Lưu ý: code hiện tại có lưu raw sequence, nhưng khi train model đang dùng sequence-derived features, chưa dùng trực tiếp token embedding sequence encoder.
+Khi train, các trường raw này đi trực tiếp qua `DaySequenceEncoder`; các sequence-derived flags chỉ còn là metadata/feature phụ để audit.
 
 #### 5. Join thành multiview
 
@@ -775,13 +789,13 @@ data/processed/03_user_day_multiview.csv
 Hàm:
 
 ```text
-make_windows_from_multiview(...)
+make_multiview_model_inputs(...)
 ```
 
 Biến dữ liệu user-day thành input model:
 
 ```text
-30 ngày × 128 chiều
+30 calendar days liên tục × 128 chiều; ngày không event được zero-fill và có empty-day sequence
 ```
 
 #### 7. Runtime normalize từ SQLite RawLogs
@@ -806,18 +820,18 @@ Chạy bằng command:
 
 ```powershell
 cd ml
-python multiview_prepare_fast.py --cert-dir ../data/cert4.2 --ldap-dir ../data/ldap --out-dir ../data/processed --holdout-users 2 --min-active-days 30 --max-rows-per-file 200000
+python multiview_prepare_fast.py --cert-dir ../data/cert4.2 --ldap-dir ../data/ldap --out-dir ../data/processed --holdout-users 2 --min-active-days 30 --max-rows-per-file 200000 --sampling-mode time-user-stratified --holdout-strategy role-stratified
 ```
 
 Nhiệm vụ:
 
-1. Đọc sample từ 5 raw logs CERT.
+1. Chọn complete user-month groups theo tháng và user trên đủ 5 nguồn; không lấy N dòng đầu theo mặc định.
 2. Đọc LDAP monthly files.
 3. Tạo unified event log.
 4. Tạo count/statistical features.
-5. Tạo sequence-derived features.
+5. Tạo raw token/source/time-gap sequences và sequence audit features.
 6. Join thành user-day multiview.
-7. Chọn holdout users có đủ 30 active days.
+7. Chọn holdout users có đủ lịch sử theo chiến lược role-stratified, không mặc định lấy top active users.
 8. Ghi output vào `data/processed`.
 
 Output chính:
@@ -826,7 +840,7 @@ Output chính:
 |---|---|
 | `00_unified_event_log.csv` | Timeline chung của toàn bộ event sau khi chuẩn hóa. |
 | `01_user_day_features.csv` | Count/statistical view theo user-day. |
-| `02_user_day_sequences.jsonl` | Sequence-derived view theo user-day. |
+| `02_user_day_sequences.jsonl` | Raw sequence + sequence audit fields theo user-day. |
 | `03_user_day_multiview.csv` | File input chính để train global model. |
 | `role_context.csv` | Role/department context từ LDAP. |
 | `holdout/index.json` | Danh sách user demo được tách riêng. |
@@ -856,23 +870,21 @@ data/processed/03_user_day_multiview.csv
 Command mẫu:
 
 ```powershell
-python train_multiview.py --scope global --multiview-csv ../data/processed/03_user_day_multiview.csv --role-context ../data/processed/role_context.csv --model-dir ../models/global --window-size 30 --epochs 1 --anomaly-quantile 0.995 --min-role-samples 25
+python train_multiview.py --scope global --multiview-csv ../data/processed/03_user_day_multiview.csv --role-context ../data/processed/role_context.csv --feature-rules ./feature_rules.json --model-dir ../models/global --window-size 30 --epochs 1 --anomaly-quantile 0.995 --min-role-users 30 --min-role-user-days 1000
 ```
 
 Nó làm:
 
 1. Đọc multiview CSV.
-2. Tách count columns và sequence columns.
-3. Apply signed log transform để xử lý count lớn và z-score âm.
-4. Scale bằng RobustScaler.
-5. PCA/project count view về 64 chiều.
-6. PCA/project sequence view về 64 chiều.
-7. Concat thành vector 128 chiều.
-8. Tạo window 30 ngày.
-9. Train TCN-Transformer Autoencoder.
-10. Tính reconstruction score.
-11. Tạo global threshold, role threshold, department threshold.
-12. Lưu model và metadata.
+2. Calendarize từng user timeline và zero-fill ngày trống.
+3. Chia chronological train/validation/test theo user-day; không random windows.
+4. Fit signed-log, RobustScaler và PCA count 64 chiều chỉ trên train rows.
+5. Encode raw token/source/time-gap sequence thành 64 chiều bằng neural encoder.
+6. Ghép thành 128 chiều và tạo rolling 30-calendar-day windows, stride 1.
+7. Train TCN-Transformer Autoencoder trên train windows.
+8. Fit global/role/department threshold trên validation windows.
+9. Giữ test windows chỉ để đánh giá một lần.
+10. Lưu model, vectorizer, metadata và `all_scores.csv`.
 
 Output:
 
@@ -880,10 +892,10 @@ Output:
 models/global/model.pt
 models/global/vectorizer.joblib
 models/global/metadata.json
-models/global/train_scores.csv
+models/global/all_scores.csv
 ```
 
-#### Train personalized
+#### Fit/update safe personalized threshold
 
 Input:
 
@@ -894,13 +906,15 @@ Input:
 Command mẫu:
 
 ```powershell
-python train_multiview.py --scope personalized --db ../data/anomaly.db --user-id <USER_ID> --model-dir ../models/personalized/<USER_ID> --global-model-dir ../models/global --role-context ../data/processed/role_context.csv --window-size 30 --epochs 1 --min-active-days 30 --anomaly-quantile 0.995
+python train_multiview.py --scope personalized --db ../data/anomaly.db --user-id <USER_ID> --model-dir ../models/personalized/<USER_ID> --global-model-dir ../models/global --role-context ../data/processed/role_context.csv --feature-rules ./feature_rules.json --min-safe-days 30 --safe-history-days 90 --update-delay-days 7 --update-every-safe-days 7
 ```
 
 Điểm quan trọng:
 
-- Personalized dùng lại `models/global/vectorizer.joblib` để transform feature cùng chuẩn với global.
-- Personalized model chỉ train khi user có đủ active days.
+- Personalized dùng lại global model/vectorizer để score lịch sử của user.
+- Chỉ ngày có score dưới role/backoff threshold, đã qua update delay và không ngay sau alert mới được coi là safe.
+- Personal threshold dùng 90 ngày gần nhất, cần tối thiểu 30 safe days và chỉ update theo cadence.
+- Không train neural model riêng cho từng user; thư mục personalized chỉ chứa threshold metadata và calibration scores.
 
 ---
 
@@ -916,7 +930,7 @@ Input:
 - user id
 - scope: global hoặc personalized
 - global model dir
-- personalized model dir nếu có
+- personalized threshold metadata dir nếu có
 
 Nó làm:
 
@@ -925,7 +939,7 @@ Nó làm:
 3. Build count view + sequence view.
 4. Dùng global vectorizer để tạo vector 128 chiều.
 5. Tạo latest 30-day window.
-6. Load model theo scope.
+6. Luôn load global neural model; scope personalized chỉ thêm personal threshold.
 7. Reconstruct window.
 8. Tính reconstruction score cho ngày cuối window.
 9. Tính `global_ratio`, `role_ratio`, `personal_ratio`.
@@ -1148,22 +1162,22 @@ Output sau khi train global:
 | File | Ý nghĩa |
 |---|---|
 | `model.pt` | PyTorch model weights cho global baseline. |
-| `vectorizer.joblib` | Scaler/PCA columns dùng để transform count + sequence về 128 chiều. |
+| `vectorizer.joblib` | Scaler/PCA fit trên train rows, dùng để chiếu count view về 64 chiều. |
 | `metadata.json` | Threshold, role thresholds, department thresholds, model version, score formula. |
-| `train_scores.csv` | Reconstruction score distribution dùng để audit threshold. |
+| `all_scores.csv` | Reconstruction score kèm chronological split/label metadata để audit và đánh giá. |
 
 ---
 
 ### `models/personalized/`
 
-Mỗi user có model riêng:
+Mỗi user có calibration metadata riêng:
 
 ```text
-models/personalized/<USER_ID>/model.pt
 models/personalized/<USER_ID>/metadata.json
+models/personalized/<USER_ID>/calibration_scores.csv
 ```
 
-Personalized model tự sinh khi user đủ 30 active days.
+Safe personal threshold chỉ active khi đủ delayed safe days; global neural model không được copy hoặc train lại theo user.
 
 ---
 
@@ -1357,18 +1371,16 @@ git commit -m "Remove generated data and model artifacts"
 
 ## 15. Điểm cần lưu ý về bản hiện tại
 
-Bản hiện tại là framework demo chạy được, nhưng có một số điểm cần thống nhất thêm nếu dùng cho nghiên cứu chính thức:
+Bản hiện tại đã đồng bộ các lỗi kiến trúc chính với tài liệu: 30 calendar days, raw sequence encoder, past-only LDAP, validation-fitted thresholds, safe personalized threshold update và evaluation metrics. Khi dùng cho nghiên cứu chính thức vẫn cần:
 
-1. `TrainEpochs`, `AnomalyQuantile`, `MinRoleSamples` cần chạy ablation/tuning.
-2. `30 active days` hiện là 30 ngày có log, chưa phải 30 calendar days có fill zero.
-3. Sequence view hiện là sequence-derived features, chưa phải token embedding encoder trực tiếp.
-4. Role/group calibration hiện là `Role → Department → Global`, chưa dùng full hierarchy như team/business_unit/function.
-5. Safe Personalized hiện mới là basic personalized; chưa có full safe update policy như update delay 7 ngày, safe history 60–90 ngày.
-6. AE-SAD semi-supervised loss chưa implement; hiện model là standard reconstruction Autoencoder.
-7. Chưa có `evaluate.py` để tính AUPRC/F1/Recall@K/detection delay.
+1. Chạy `evaluate_multiview.py` cho nhiều quantile và đầy đủ A0–A5; không chốt tham số chỉ từ demo.
+2. Regenerate `data/processed` bằng `full` hoặc `time-user-stratified`; các artifact cũ tạo bằng `head` vẫn bị lệch thời gian.
+3. Chỉ bật after-hours trong `feature_rules.json` khi thí nghiệm công bố và kiểm chứng lịch làm việc; CERT R4.2 không cho một mốc 08:00–18:00 cố định toàn tổ chức.
+4. Giữ hierarchy `Role → Department → Global`; chỉ mở rộng khi có đủ mẫu và ablation chứng minh hiệu quả.
+5. AE-SAD không phải phần thiếu của model chính: framework chủ đích giữ unsupervised reconstruction, không dùng anomaly label trong loss.
 
 ---
 
 ## 16. Cách giải thích ngắn cho người mới vào project
 
-Dự án này phát hiện anomaly bằng cách học hành vi bình thường của user theo cửa sổ 30 ngày. Mỗi ngày của user được biến thành 2 nhóm đặc trưng: nhóm đếm số lượng hành vi và nhóm thể hiện chuỗi hành vi. Hai nhóm này được ghép thành vector 128 chiều, sau đó đưa vào TCN-Transformer Autoencoder. Model reconstruct lại window hành vi; nếu reconstruct sai nhiều thì score cao và bị xem là bất thường. User mới dùng global baseline và threshold theo role/department. Khi user có đủ 30 active days, hệ thống train personalized model riêng cho user đó và các lần detect sau sẽ dùng personalized baseline.
+Dự án này phát hiện anomaly bằng cách học hành vi theo cửa sổ 30 calendar days liên tục. Count view được chiếu về 64 chiều; raw token/source/time-gap sequence được neural encoder học về 64 chiều; hai nhánh ghép thành 128 chiều rồi đi qua TCN-Transformer Autoencoder. User mới dùng global threshold và backoff Role → Department → Global. Khi đủ delayed safe history, hệ thống chỉ fit/update personal threshold robust từ score của global model, không train neural model riêng cho user.

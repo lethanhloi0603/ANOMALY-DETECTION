@@ -43,6 +43,12 @@ public class MlTrainingResult
     [JsonPropertyName("ok")]
     public bool Ok { get; set; }
 
+    [JsonPropertyName("eligible")]
+    public bool Eligible { get; set; }
+
+    [JsonPropertyName("updated")]
+    public bool Updated { get; set; }
+
     [JsonPropertyName("scope")]
     public string? Scope { get; set; }
 
@@ -60,6 +66,9 @@ public class MlTrainingResult
 
     [JsonPropertyName("active_days")]
     public int ActiveDays { get; set; }
+
+    [JsonPropertyName("safe_days")]
+    public int SafeDays { get; set; }
 
     [JsonPropertyName("threshold")]
     public double Threshold { get; set; }

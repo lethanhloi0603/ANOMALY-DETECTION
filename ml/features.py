@@ -8,6 +8,8 @@ from typing import Iterable, Optional
 import numpy as np
 import pandas as pd
 
+from multiview_features import count_external, is_after_hour
+
 CANONICAL_COLUMNS = [
     "id", "date", "user", "pc", "event_type", "activity", "url", "filename",
     "to", "cc", "bcc", "from", "size", "attachment_count", "content",
@@ -70,10 +72,7 @@ def read_events_from_sqlite(db_path: str, user_id: Optional[str] = None) -> pd.D
 
 
 def is_external_email(value: str) -> bool:
-    if not isinstance(value, str) or value.strip() == "":
-        return False
-    parts = [p.strip().lower() for p in value.replace(";", ",").split(",") if p.strip()]
-    return any("@dtaa" not in p for p in parts)
+    return count_external(value) > 0
 
 
 def build_daily_features(events: pd.DataFrame, feature_columns: Optional[list[str]] = None) -> pd.DataFrame:
@@ -84,7 +83,7 @@ def build_daily_features(events: pd.DataFrame, feature_columns: Optional[list[st
 
     events["day"] = events["date"].dt.floor("D")
     events["hour"] = events["date"].dt.hour
-    events["is_after_hour"] = ((events["hour"] < 8) | (events["hour"] >= 18)).astype(int)
+    events["is_after_hour"] = events["date"].map(is_after_hour).astype(int)
     et = events["event_type"].fillna("").str.lower()
     act = events["activity"].fillna("").str.lower()
     events["is_logon"] = ((et == "logon") & act.str.contains("logon", na=False)).astype(int)

@@ -32,6 +32,7 @@ public class PredictionService
             "--model-dir", modelDir,
             "--global-model-dir", globalModelDir,
             "--role-context", _paths.ResolvePath(_settings.RoleContextPath),
+            "--feature-rules", _paths.ResolvePath(_settings.FeatureRulesPath),
             "--window-size", _settings.WindowSize.ToString()
         };
 

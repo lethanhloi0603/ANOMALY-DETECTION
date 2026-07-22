@@ -85,3 +85,7 @@ Thumbs.db
 .env.*
 appsettings.Development.json
 backend/**/appsettings.Development.json
+
+# Local review/extraction scratch artifacts
+.codex-work/
+ml/.venv311/

@@ -40,11 +40,26 @@ public class TrainingService
             "--scope", "global",
             "--multiview-csv", multiviewPath,
             "--role-context", roleContextPath,
+            "--feature-rules", _paths.ResolvePath(_settings.FeatureRulesPath),
             "--model-dir", modelDir,
             "--window-size", _settings.WindowSize.ToString(),
             "--epochs", _settings.TrainEpochs.ToString(),
+            "--batch-size", _settings.TrainBatchSize.ToString(),
+            "--lr", _settings.LearningRate.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            "--hidden-dim", _settings.HiddenDimension.ToString(),
+            "--kernel-size", _settings.KernelSize.ToString(),
+            "--dropout", _settings.Dropout.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            "--transformer-layers", _settings.TransformerLayers.ToString(),
+            "--heads", _settings.AttentionHeads.ToString(),
+            "--max-events-per-day", _settings.MaxEventsPerDay.ToString(),
+            "--training-label-policy", _settings.TrainingLabelPolicy,
+            "--calibration-label-policy", _settings.CalibrationLabelPolicy,
+            "--num-workers", _settings.TrainingNumWorkers.ToString(),
+            "--progress-every", _settings.TrainingProgressEvery.ToString(),
+            "--random-seed", _settings.RandomSeed.ToString(),
             "--anomaly-quantile", _settings.AnomalyQuantile.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            "--min-role-samples", _settings.MinRoleSamples.ToString()
+            "--min-role-users", _settings.MinRoleUsers.ToString(),
+            "--min-role-user-days", _settings.MinRoleUserDays.ToString()
         };
 
         var run = await _pythonRunner.RunAsync("train_multiview.py", args, _settings.TrainingTimeoutSeconds, cancellationToken);
@@ -85,9 +100,22 @@ public class TrainingService
                 "--model-dir", modelDir,
                 "--global-model-dir", globalModelDir,
                 "--role-context", _paths.ResolvePath(_settings.RoleContextPath),
+                "--feature-rules", _paths.ResolvePath(_settings.FeatureRulesPath),
                 "--window-size", _settings.WindowSize.ToString(),
                 "--epochs", _settings.TrainEpochs.ToString(),
-                "--min-active-days", _settings.PersonalizedActiveDaysThreshold.ToString(),
+                "--batch-size", _settings.TrainBatchSize.ToString(),
+                "--lr", _settings.LearningRate.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                "--hidden-dim", _settings.HiddenDimension.ToString(),
+                "--kernel-size", _settings.KernelSize.ToString(),
+                "--dropout", _settings.Dropout.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                "--transformer-layers", _settings.TransformerLayers.ToString(),
+                "--heads", _settings.AttentionHeads.ToString(),
+                "--max-events-per-day", _settings.MaxEventsPerDay.ToString(),
+                "--min-safe-days", _settings.PersonalizedActiveDaysThreshold.ToString(),
+                "--safe-history-days", _settings.PersonalizedSafeHistoryDays.ToString(),
+                "--update-delay-days", _settings.PersonalizedUpdateDelayDays.ToString(),
+                "--update-every-safe-days", _settings.PersonalizedUpdateEverySafeDays.ToString(),
+                "--update-every-calendar-days", _settings.PersonalizedUpdateEveryCalendarDays.ToString(),
                 "--anomaly-quantile", _settings.AnomalyQuantile.ToString(System.Globalization.CultureInfo.InvariantCulture)
             };
 
@@ -114,10 +142,16 @@ public class TrainingService
             state.LogCount = logCount;
             state.ActiveDaysCount = activeDays;
             state.IsTraining = false;
-            state.IsPersonalizedReady = true;
-            state.PersonalizedModelPath = modelDir;
-            state.LastPersonalizedTrainingAtUtc = DateTime.UtcNow;
-            state.LastTrainingMessage = result.Message ?? "Personalized model trained.";
+            state.IsPersonalizedReady = result.Eligible || state.IsPersonalizedReady;
+            if (result.Eligible)
+            {
+                state.PersonalizedModelPath = modelDir;
+            }
+            if (result.Updated)
+            {
+                state.LastPersonalizedTrainingAtUtc = DateTime.UtcNow;
+            }
+            state.LastTrainingMessage = result.Message ?? "Personalized threshold calibration checked.";
             state.UpdatedAtUtc = DateTime.UtcNow;
 
             await _db.SaveChangesAsync(cancellationToken);
@@ -142,20 +176,57 @@ public class TrainingService
             return false;
         }
 
-        if (state is { IsPersonalizedReady: true })
-        {
-            return false;
-        }
-
         if (state is { IsTraining: true })
         {
             return false;
         }
 
-        _logger.LogInformation("User {UserId} reached {ActiveDays} active days. Training personalized baseline.", userId, activeDaysCount);
+        if (!NeedsPersonalizedThresholdUpdate(userId, activeDaysCount))
+        {
+            return false;
+        }
 
-        await TrainPersonalizedAsync(userId, cancellationToken);
-        return true;
+        _logger.LogInformation(
+            "User {UserId} has {ActiveDays} active days. Checking safe personalized threshold calibration.",
+            userId,
+            activeDaysCount);
+
+        var result = await TrainPersonalizedAsync(userId, cancellationToken);
+        return result.Updated;
+    }
+
+    private bool NeedsPersonalizedThresholdUpdate(string userId, int activeDaysCount)
+    {
+        var modelRoot = _paths.ResolvePath(_settings.ModelDirectory);
+        var metadataPath = Path.Combine(modelRoot, "personalized", SanitizePathPart(userId), "metadata.json");
+        if (!File.Exists(metadataPath))
+        {
+            return true;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(metadataPath));
+            var root = document.RootElement;
+            if (!root.TryGetProperty("calibration_type", out var calibrationType)
+                || calibrationType.GetString() != "threshold_only_no_personal_neural_model")
+            {
+                return true;
+            }
+
+            var calibratedActiveDays = root.TryGetProperty("active_days", out var activeDaysElement)
+                ? activeDaysElement.GetInt32()
+                : 0;
+            return activeDaysCount >= calibratedActiveDays + _settings.PersonalizedUpdateEverySafeDays;
+        }
+        catch (Exception exception)
+        {
+            _logger.LogWarning(
+                exception,
+                "Could not inspect personalized threshold metadata for {UserId}; recalibration will be attempted.",
+                userId);
+            return true;
+        }
     }
 
     private static MlTrainingResult ParseTrainingResult(string stdout)
