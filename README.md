@@ -6,7 +6,6 @@ calendar days.
 
 Tài liệu nên đọc:
 
-- [FRAMEWORK_FLOW.md](FRAMEWORK_FLOW.md): kiến trúc và luồng framework sau refactor.
 - [ml/README_ML.md](ml/README_ML.md): câu lệnh prepare, train, evaluate và predict.
 - [README_TUTORIAL.md](README_TUTORIAL.md): cài đặt backend/frontend/ML từ đầu.
 - [README_SYSTEM.md](README_SYSTEM.md): mô tả chi tiết các thành phần hệ thống.
