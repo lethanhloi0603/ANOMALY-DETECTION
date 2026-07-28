@@ -1,0 +1,71 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-insider_threat}
+      POSTGRES_USER: ${POSTGRES_USER:-insider_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-insider_app}:${POSTGRES_PASSWORD:-change-me}@db:5432/${POSTGRES_DB:-insider_threat}
+      AUTO_CREATE_SCHEMA: "false"
+    command:
+      - sh
+      - -c
+      - alembic upgrade head && python -m cli.init_db
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-insider_app}:${POSTGRES_PASSWORD:-change-me}@db:5432/${POSTGRES_DB:-insider_threat}
+      AUTO_CREATE_SCHEMA: "false"
+      APP_ENV: ${APP_ENV:-production}
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      API_KEY: "${API_KEY:?API_KEY must be set for production}"
+      API_KEY_ACTOR: ${API_KEY_ACTOR:-api-key-principal}
+      SCORER_API_KEY: "${SCORER_API_KEY:?SCORER_API_KEY must be set and differ from API_KEY}"
+      SCORER_API_KEY_ACTOR: ${SCORER_API_KEY_ACTOR:-trusted-scorer}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      MAX_BATCH_EVENTS: ${MAX_BATCH_EVENTS:-1000}
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-2097152}
+      LOCKED_ALERT_THRESHOLD: ${LOCKED_ALERT_THRESHOLD:-}
+      FRAMEWORK_CONFIG_PATH: ${FRAMEWORK_CONFIG_PATH:-/app/backend/config/framework.v4.json}
+      FEATURE_CATALOG_PATH: ${FEATURE_CATALOG_PATH:-/app/machine_learning/config/feature128.v5.json}
+      SEQUENCE_CONFIG_PATH: ${SEQUENCE_CONFIG_PATH:-/app/machine_learning/config/sequence7.v4.json}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - app_data:/app/data/runtime
+      - app_artifacts:/app/data/artifacts
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  app_data:
+  app_artifacts:

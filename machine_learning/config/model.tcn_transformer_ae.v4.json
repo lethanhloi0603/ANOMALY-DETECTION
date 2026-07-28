@@ -1,0 +1,42 @@
+{
+  "schema_version": "tcn-transformer-ae.v4",
+  "feature_schema_version": "feature128.v5",
+  "sequence_schema_version": "sequence7.v4",
+  "window_days": 30,
+  "window_semantics": {
+    "range": "[D-29,D]",
+    "future_days_allowed": false,
+    "inactive_employee_days_retained": true
+  },
+  "feature_dimension": 128,
+  "feature_embedding_dimension": 64,
+  "sequence_embedding_dimension": 64,
+  "day_embedding_dimension": 128,
+  "sequence_max_len": 256,
+  "tcn": {
+    "channels": 128,
+    "kernel_size": 3,
+    "dilations": [1, 2, 4, 8],
+    "dropout": 0.1
+  },
+  "transformer": {
+    "layers": 2,
+    "heads": 4,
+    "feed_forward_dimension": 256,
+    "dropout": 0.1
+  },
+  "loss": {
+    "feature_weight": 0.5,
+    "sequence_weight": 0.5,
+    "feature_reduction": "masked_mean_over_observed_dimensions_and_days",
+    "sequence_component_reduction": "equal_mean_over_available_components",
+    "sequence_components": {
+      "event_token_cross_entropy": 1.0,
+      "pc_context_cross_entropy": 1.0,
+      "calendar_context_cross_entropy": 1.0,
+      "gap_bucket_cross_entropy": 1.0,
+      "cyclic_time_mse": 1.0
+    },
+    "pad_positions_in_loss": false
+  }
+}
