@@ -1,0 +1,905 @@
+{
+  "schema_version": "feature128.v5",
+  "feature_count": 128,
+  "runtime_materializer": {
+    "authoritative_implementation": "insider_ml.stream_store._features_from_payloads",
+    "store_schema_version": "cert-user-day-store.v1",
+    "implementation_checksum_required_in_preprocessing_artifact": true,
+    "formula_text_in_feature_entries": "documentation_only",
+    "zero_semantics": "count/sum features are observed zero on an eligible day with no matching event",
+    "missing_semantics": "undefined ratio/statistic/history/baseline is value=0 with feature_mask=false",
+    "history_order": "strictly before D; no future or current-day peer event",
+    "primary_content_policy": "metadata_only"
+  },
+  "primary_experiment": {
+    "content_policy": "metadata_only",
+    "raw_content_allowed": false,
+    "ocean_allowed": false,
+    "scenario_engineered_chain_features_allowed": false,
+    "masked_ablation_only_feature_ids": ["X12", "X13", "X14", "X15"],
+    "masked_ablation_semantics": "dimension retained for schema compatibility; feature_mask=false in primary"
+  },
+  "extension_category_policy": {
+    "category_mapping_enabled": false,
+    "mapping_version": null,
+    "fallback": "neutral_extension_metadata_only"
+  },
+  "pc_context_policy": {
+    "fit_split": "TRAIN",
+    "unit": "distinct_user_day",
+    "shared_min_distinct_users": 5,
+    "shared_max_dominance_exclusive": 0.5,
+    "owner_min_dominance_inclusive": 0.5,
+    "tie_break": "user_id_ascending",
+    "freeze_after_train": true
+  },
+  "domain_novelty_policy": {
+    "history_window_calendar_days": 30,
+    "exclude_current_day": true,
+    "minimum_prior_http_events": 20,
+    "insufficient_history": "mask_false",
+    "hostname_normalization": "lowercase_idna_strip_trailing_dot"
+  },
+  "temporal_baseline": {
+    "fixed_business_hours": null,
+    "time_representation": "cyclic_minute_of_day",
+    "timezone_source": "organization",
+    "history_policy": "past_only_primary_references_frozen_after_train",
+    "fallback_order": [
+      "PERSON",
+      "ROLE",
+      "GLOBAL"
+    ],
+    "deviation": "robust_positive_z_of_circular_distance"
+  },
+  "features": [
+    {
+      "id": "L01",
+      "name": "logon_count",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time"
+    },
+    {
+      "id": "L02",
+      "name": "logoff_count",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time"
+    },
+    {
+      "id": "L03",
+      "name": "first_logon_time_deviation",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time",
+      "formula": "robust_positive_z(circular_distance(first_logon, selected_baseline_center))",
+      "missing_policy": "mask_false"
+    },
+    {
+      "id": "L04",
+      "name": "last_logoff_time_deviation",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time",
+      "formula": "robust_positive_z(circular_distance(last_logoff, selected_baseline_center))",
+      "missing_policy": "mask_false"
+    },
+    {
+      "id": "L05",
+      "name": "weekend_logon_count",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time"
+    },
+    {
+      "id": "L06",
+      "name": "distinct_logon_pc_count",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time"
+    },
+    {
+      "id": "L07",
+      "name": "own_pc_logon_count",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time"
+    },
+    {
+      "id": "L08",
+      "name": "shared_pc_logon_count",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time"
+    },
+    {
+      "id": "L09",
+      "name": "foreign_pc_logon_count",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time"
+    },
+    {
+      "id": "L10",
+      "name": "foreign_pc_logon_ratio",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time"
+    },
+    {
+      "id": "L11",
+      "name": "first_logon_minute",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time"
+    },
+    {
+      "id": "L12",
+      "name": "last_logon_minute",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time"
+    },
+    {
+      "id": "L13",
+      "name": "last_logoff_minute",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time"
+    },
+    {
+      "id": "L14",
+      "name": "work_span_minutes",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time"
+    },
+    {
+      "id": "L15",
+      "name": "matched_logon_session_count",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time"
+    },
+    {
+      "id": "L16",
+      "name": "total_logon_session_minutes",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time"
+    },
+    {
+      "id": "L17",
+      "name": "max_logon_session_minutes",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time"
+    },
+    {
+      "id": "L18",
+      "name": "session_time_deviation_max",
+      "group": "Logon",
+      "source_constraint": "Từ logon.csv; PC/session/time",
+      "formula": "max temporal deviation over observed logon/logoff session boundaries",
+      "missing_policy": "mask_false"
+    },
+    {
+      "id": "D01",
+      "name": "device_connect_count",
+      "group": "Device",
+      "source_constraint": "Từ device.csv; pairing/context"
+    },
+    {
+      "id": "D02",
+      "name": "device_disconnect_count",
+      "group": "Device",
+      "source_constraint": "Từ device.csv; pairing/context"
+    },
+    {
+      "id": "D03",
+      "name": "device_session_count",
+      "group": "Device",
+      "source_constraint": "Từ device.csv; pairing/context"
+    },
+    {
+      "id": "D04",
+      "name": "unmatched_connect_count",
+      "group": "Device",
+      "source_constraint": "Từ device.csv; pairing/context"
+    },
+    {
+      "id": "D05",
+      "name": "unmatched_disconnect_count",
+      "group": "Device",
+      "source_constraint": "Từ device.csv; pairing/context"
+    },
+    {
+      "id": "D06",
+      "name": "device_time_deviation_mean",
+      "group": "Device",
+      "source_constraint": "Từ device.csv; pairing/context",
+      "formula": "mean temporal deviation of device events against selected past-only baseline",
+      "missing_policy": "mask_false"
+    },
+    {
+      "id": "D07",
+      "name": "weekend_device_connect_count",
+      "group": "Device",
+      "source_constraint": "Từ device.csv; pairing/context"
+    },
+    {
+      "id": "D08",
+      "name": "own_pc_device_connect_count",
+      "group": "Device",
+      "source_constraint": "Từ device.csv; pairing/context"
+    },
+    {
+      "id": "D09",
+      "name": "shared_pc_device_connect_count",
+      "group": "Device",
+      "source_constraint": "Từ device.csv; pairing/context"
+    },
+    {
+      "id": "D10",
+      "name": "foreign_pc_device_connect_count",
+      "group": "Device",
+      "source_constraint": "Từ device.csv; pairing/context"
+    },
+    {
+      "id": "D11",
+      "name": "device_active_minutes",
+      "group": "Device",
+      "source_constraint": "Từ device.csv; pairing/context"
+    },
+    {
+      "id": "D12",
+      "name": "max_device_session_minutes",
+      "group": "Device",
+      "source_constraint": "Từ device.csv; pairing/context"
+    },
+    {
+      "id": "F01",
+      "name": "file_copy_count",
+      "group": "File",
+      "source_constraint": "Từ file.csv; chỉ metadata file/removable copy"
+    },
+    {
+      "id": "F02",
+      "name": "distinct_filename_count",
+      "group": "File",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F03",
+      "name": "distinct_extension_count",
+      "group": "File",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F04",
+      "name": "filename_length_max",
+      "group": "File",
+      "formula": "maximum unicode code-point length of filename on D",
+      "missing_policy": "mask_false_when_no_file_event",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F05",
+      "name": "filename_length_std",
+      "group": "File",
+      "formula": "population standard deviation of filename length on D",
+      "missing_policy": "mask_false_when_no_file_event",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F06",
+      "name": "extension_length_mean",
+      "group": "File",
+      "formula": "mean normalized extension length over files with an extension on D",
+      "missing_policy": "mask_false_when_no_extension",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F07",
+      "name": "extension_length_max",
+      "group": "File",
+      "formula": "maximum normalized extension length on D",
+      "missing_policy": "mask_false_when_no_extension",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F08",
+      "name": "extensionless_file_count",
+      "group": "File",
+      "formula": "count filenames with no normalized extension on D",
+      "missing_policy": "zero_when_observed_day_has_no_file_event",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F09",
+      "name": "multi_dot_filename_count",
+      "group": "File",
+      "formula": "count filenames whose basename contains at least two dots on D",
+      "missing_policy": "zero_when_observed_day_has_no_file_event",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F10",
+      "name": "distinct_filename_stem_count",
+      "group": "File",
+      "formula": "count distinct case-folded filename stems on D",
+      "missing_policy": "zero_when_observed_day_has_no_file_event",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F11",
+      "name": "repeated_extension_copy_count",
+      "group": "File",
+      "formula": "sum max(extension_count - 1, 0) over normalized non-empty extensions on D",
+      "missing_policy": "zero_when_observed_day_has_no_file_event",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F12",
+      "name": "extension_present_ratio",
+      "group": "File",
+      "formula": "files with a normalized extension divided by file_copy_count on D",
+      "missing_policy": "mask_false_when_no_file_event",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F13",
+      "name": "file_time_deviation_mean",
+      "group": "File",
+      "source_constraint": "Từ file.csv; removable copy/content",
+      "formula": "mean temporal deviation of file events against selected past-only baseline",
+      "missing_policy": "mask_false"
+    },
+    {
+      "id": "F14",
+      "name": "weekend_file_count",
+      "group": "File",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F15",
+      "name": "own_pc_file_count",
+      "group": "File",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F16",
+      "name": "shared_pc_file_count",
+      "group": "File",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F17",
+      "name": "foreign_pc_file_count",
+      "group": "File",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F18",
+      "name": "distinct_file_pc_count",
+      "group": "File",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F19",
+      "name": "filename_length_mean",
+      "group": "File",
+      "formula": "mean unicode code-point length of filename for file-copy events on D",
+      "missing_policy": "mask_false_when_no_file_event",
+      "source_constraint": "Từ file.csv; chỉ filename/timestamp metadata"
+    },
+    {
+      "id": "F20",
+      "name": "file_copy_interarrival_mean_minutes",
+      "group": "File",
+      "formula": "mean non-negative minute gap between consecutive file-copy events on D",
+      "missing_policy": "mask_false_when_fewer_than_2_file_events",
+      "source_constraint": "Từ file.csv; chỉ timestamp metadata"
+    },
+    {
+      "id": "F21",
+      "name": "file_copy_interarrival_min_minutes",
+      "group": "File",
+      "formula": "minimum non-negative minute gap between consecutive file-copy events on D",
+      "missing_policy": "mask_false_when_fewer_than_2_file_events",
+      "source_constraint": "Từ file.csv; chỉ timestamp metadata"
+    },
+    {
+      "id": "F22",
+      "name": "repeated_filename_copy_count",
+      "group": "File",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F23",
+      "name": "file_extension_entropy",
+      "group": "File",
+      "source_constraint": "Từ file.csv; removable copy/content"
+    },
+    {
+      "id": "F24",
+      "name": "file_copy_burst_count_5m",
+      "group": "File",
+      "formula": "count maximal runs of at least 2 file-copy events whose consecutive gaps are <=5 minutes",
+      "missing_policy": "zero_when_observed_day_has_fewer_than_2_file_events",
+      "source_constraint": "Từ file.csv; chỉ timestamp metadata"
+    },
+    {
+      "id": "H01",
+      "name": "http_request_count",
+      "group": "HTTP",
+      "source_constraint": "Từ http.csv; URL/content/history"
+    },
+    {
+      "id": "H02",
+      "name": "distinct_url_count",
+      "group": "HTTP",
+      "source_constraint": "Từ http.csv; URL/content/history"
+    },
+    {
+      "id": "H03",
+      "name": "distinct_domain_count",
+      "group": "HTTP",
+      "source_constraint": "Từ http.csv; URL/content/history"
+    },
+    {
+      "id": "H04",
+      "name": "distinct_path_count",
+      "group": "HTTP",
+      "source_constraint": "Từ http.csv; URL/content/history"
+    },
+    {
+      "id": "H05",
+      "name": "http_time_deviation_mean",
+      "group": "HTTP",
+      "source_constraint": "Từ http.csv; URL/content/history",
+      "formula": "mean temporal deviation of HTTP events against selected past-only baseline",
+      "missing_policy": "mask_false"
+    },
+    {
+      "id": "H06",
+      "name": "weekend_http_count",
+      "group": "HTTP",
+      "source_constraint": "Từ http.csv; URL/content/history"
+    },
+    {
+      "id": "H07",
+      "name": "own_pc_http_count",
+      "group": "HTTP",
+      "source_constraint": "Từ http.csv; URL/content/history"
+    },
+    {
+      "id": "H08",
+      "name": "shared_pc_http_count",
+      "group": "HTTP",
+      "source_constraint": "Từ http.csv; URL/content/history"
+    },
+    {
+      "id": "H09",
+      "name": "foreign_pc_http_count",
+      "group": "HTTP",
+      "source_constraint": "Từ http.csv; URL/content/history"
+    },
+    {
+      "id": "H10",
+      "name": "distinct_hostname_count",
+      "group": "HTTP",
+      "formula": "count distinct normalized hostnames observed on D",
+      "missing_policy": "zero_when_observed_day_has_no_http_event",
+      "source_constraint": "Từ http.csv; chỉ URL metadata, không risk catalog"
+    },
+    {
+      "id": "H11",
+      "name": "distinct_scheme_count",
+      "group": "HTTP",
+      "formula": "count distinct normalized URL schemes observed on D",
+      "missing_policy": "zero_when_observed_day_has_no_http_event",
+      "source_constraint": "Từ http.csv; chỉ URL metadata, không risk catalog"
+    },
+    {
+      "id": "H12",
+      "name": "https_request_count",
+      "group": "HTTP",
+      "formula": "count HTTP events whose normalized scheme equals https on D",
+      "missing_policy": "zero_when_observed_day_has_no_http_event",
+      "source_constraint": "Từ http.csv; chỉ URL metadata, không risk catalog"
+    },
+    {
+      "id": "H13",
+      "name": "query_present_request_count",
+      "group": "HTTP",
+      "formula": "count HTTP events with a non-empty URL query on D",
+      "missing_policy": "zero_when_observed_day_has_no_http_event",
+      "source_constraint": "Từ http.csv; chỉ URL metadata, không risk catalog"
+    },
+    {
+      "id": "H14",
+      "name": "distinct_query_key_count",
+      "group": "HTTP",
+      "formula": "count distinct normalized query-parameter keys observed on D; values discarded",
+      "missing_policy": "zero_when_observed_day_has_no_http_event",
+      "source_constraint": "Từ http.csv; chỉ query-key metadata, bỏ parameter value"
+    },
+    {
+      "id": "H15",
+      "name": "repeated_hostname_request_count",
+      "group": "HTTP",
+      "formula": "sum max(hostname_event_count - 1, 0) over normalized hostnames on D",
+      "missing_policy": "zero_when_observed_day_has_no_http_event",
+      "source_constraint": "Từ http.csv; chỉ URL metadata, không risk catalog"
+    },
+    {
+      "id": "H16",
+      "name": "hostname_length_mean",
+      "group": "HTTP",
+      "formula": "mean unicode code-point length of normalized hostname on D",
+      "missing_policy": "mask_false_when_no_valid_hostname",
+      "source_constraint": "Từ http.csv; chỉ hostname metadata"
+    },
+    {
+      "id": "H17",
+      "name": "hostname_length_max",
+      "group": "HTTP",
+      "formula": "maximum unicode code-point length of normalized hostname on D",
+      "missing_policy": "mask_false_when_no_valid_hostname",
+      "source_constraint": "Từ http.csv; chỉ hostname metadata"
+    },
+    {
+      "id": "H18",
+      "name": "url_length_mean",
+      "group": "HTTP",
+      "formula": "mean unicode code-point length of raw URL on D",
+      "missing_policy": "mask_false_when_no_http_event",
+      "source_constraint": "Từ http.csv; chỉ URL metadata"
+    },
+    {
+      "id": "H19",
+      "name": "url_length_max",
+      "group": "HTTP",
+      "formula": "maximum unicode code-point length of raw URL on D",
+      "missing_policy": "mask_false_when_no_http_event",
+      "source_constraint": "Từ http.csv; chỉ URL metadata"
+    },
+    {
+      "id": "H20",
+      "name": "url_path_depth_mean",
+      "group": "HTTP",
+      "formula": "mean count of non-empty URL path segments per HTTP event on D",
+      "missing_policy": "mask_false_when_no_http_event",
+      "source_constraint": "Từ http.csv; chỉ URL path metadata"
+    },
+    {
+      "id": "H21",
+      "name": "distinct_url_path_count",
+      "group": "HTTP",
+      "formula": "count distinct normalized URL paths on D",
+      "missing_policy": "zero_when_observed_day_has_no_http_event",
+      "source_constraint": "Từ http.csv; chỉ URL path metadata"
+    },
+    {
+      "id": "H22",
+      "name": "domain_entropy",
+      "group": "HTTP",
+      "source_constraint": "Từ http.csv; URL/content/history"
+    },
+    {
+      "id": "H23",
+      "name": "repeated_url_request_count",
+      "group": "HTTP",
+      "source_constraint": "Từ http.csv; URL/content/history"
+    },
+    {
+      "id": "H24",
+      "name": "new_domain_count_30d",
+      "group": "HTTP",
+      "source_constraint": "Từ http.csv; URL/content/history"
+    },
+    {
+      "id": "E01",
+      "name": "email_sent_count",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E02",
+      "name": "email_time_deviation_mean",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content",
+      "formula": "mean temporal deviation of email events against selected past-only baseline",
+      "missing_policy": "mask_false"
+    },
+    {
+      "id": "E03",
+      "name": "weekend_email_count",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E04",
+      "name": "own_pc_email_count",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E05",
+      "name": "shared_pc_email_count",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E06",
+      "name": "foreign_pc_email_count",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E07",
+      "name": "recipient_total_count",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E08",
+      "name": "unique_recipient_count",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E09",
+      "name": "internal_recipient_total",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E10",
+      "name": "external_recipient_total",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E11",
+      "name": "external_recipient_email_count",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E12",
+      "name": "external_recipient_ratio",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E13",
+      "name": "to_recipient_total",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E14",
+      "name": "cc_recipient_total",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E15",
+      "name": "bcc_recipient_total",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E16",
+      "name": "bcc_email_count",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E17",
+      "name": "attachment_email_count",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E18",
+      "name": "attachment_total_count",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E19",
+      "name": "attachment_max_count",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E20",
+      "name": "email_size_total",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E21",
+      "name": "email_size_mean",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E22",
+      "name": "email_size_max",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E23",
+      "name": "personal_from_email_count",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "E24",
+      "name": "recipient_count_mean",
+      "group": "Email",
+      "formula": "mean total to+cc+bcc recipient count across sent emails on D",
+      "missing_policy": "mask_false_when_no_email_event",
+      "source_constraint": "Từ email.csv; chỉ recipient-count metadata"
+    },
+    {
+      "id": "E25",
+      "name": "email_size_std",
+      "group": "Email",
+      "formula": "population standard deviation of email size bytes on D",
+      "missing_policy": "mask_false_when_no_email_event",
+      "source_constraint": "Từ email.csv; chỉ size metadata"
+    },
+    {
+      "id": "E26",
+      "name": "new_external_recipient_count_30d",
+      "group": "Email",
+      "source_constraint": "Từ email.csv; recipient/size/content"
+    },
+    {
+      "id": "X01",
+      "name": "total_event_count",
+      "group": "Cross-source",
+      "source_constraint": "Từ nhiều nguồn; đúng thứ tự/cửa sổ"
+    },
+    {
+      "id": "X02",
+      "name": "active_channel_count",
+      "group": "Cross-source",
+      "source_constraint": "Từ nhiều nguồn; đúng thứ tự/cửa sổ"
+    },
+    {
+      "id": "X03",
+      "name": "unusual_time_relative_to_baseline_mean",
+      "group": "Cross-source",
+      "source_constraint": "Từ nhiều nguồn; đúng thứ tự/cửa sổ",
+      "formula": "mean temporal deviation across all observed events",
+      "missing_policy": "mask_false"
+    },
+    {
+      "id": "X04",
+      "name": "unusual_time_relative_to_baseline_max",
+      "group": "Cross-source",
+      "source_constraint": "Từ nhiều nguồn; đúng thứ tự/cửa sổ",
+      "formula": "max temporal deviation across all observed events",
+      "missing_policy": "mask_false"
+    },
+    {
+      "id": "X05",
+      "name": "weekend_event_count",
+      "group": "Cross-source",
+      "source_constraint": "Từ nhiều nguồn; đúng thứ tự/cửa sổ"
+    },
+    {
+      "id": "X06",
+      "name": "weekend_event_ratio",
+      "group": "Cross-source",
+      "source_constraint": "Từ nhiều nguồn; đúng thứ tự/cửa sổ"
+    },
+    {
+      "id": "X07",
+      "name": "own_pc_event_count",
+      "group": "Cross-source",
+      "source_constraint": "Từ nhiều nguồn; đúng thứ tự/cửa sổ"
+    },
+    {
+      "id": "X08",
+      "name": "shared_pc_event_count",
+      "group": "Cross-source",
+      "source_constraint": "Từ nhiều nguồn; đúng thứ tự/cửa sổ"
+    },
+    {
+      "id": "X09",
+      "name": "foreign_pc_event_count",
+      "group": "Cross-source",
+      "source_constraint": "Từ nhiều nguồn; đúng thứ tự/cửa sổ"
+    },
+    {
+      "id": "X10",
+      "name": "foreign_pc_event_ratio",
+      "group": "Cross-source",
+      "source_constraint": "Từ nhiều nguồn; đúng thứ tự/cửa sổ"
+    },
+    {
+      "id": "X11",
+      "name": "distinct_all_pc_count",
+      "group": "Cross-source",
+      "source_constraint": "Từ nhiều nguồn; đúng thứ tự/cửa sổ"
+    },
+    {
+      "id": "X12",
+      "name": "source_transition_count",
+      "group": "Cross-source",
+      "formula": "count adjacent event pairs whose source changes",
+      "missing_policy": "zero_when_fewer_than_2_events",
+      "source_constraint": "Từ nhiều nguồn; đúng thứ tự/cửa sổ"
+    },
+    {
+      "id": "X13",
+      "name": "distinct_source_transition_count",
+      "group": "Cross-source",
+      "formula": "count distinct ordered adjacent source-transition pairs",
+      "missing_policy": "zero_when_fewer_than_2_events",
+      "source_constraint": "Từ nhiều nguồn; đúng thứ tự/cửa sổ"
+    },
+    {
+      "id": "X14",
+      "name": "source_transition_entropy",
+      "group": "Cross-source",
+      "formula": "Shannon entropy base-2 over ordered adjacent source-transition pairs",
+      "missing_policy": "zero_when_fewer_than_2_events",
+      "source_constraint": "Từ nhiều nguồn; đúng thứ tự/cửa sổ"
+    },
+    {
+      "id": "X15",
+      "name": "inter_event_gap_p95_minutes",
+      "group": "Cross-source",
+      "formula": "nearest-rank 95th percentile of non-negative adjacent inter-event gaps in minutes",
+      "missing_policy": "mask_false_when_fewer_than_2_events",
+      "source_constraint": "Từ nhiều nguồn; đúng thứ tự/cửa sổ"
+    },
+    {
+      "id": "X16",
+      "name": "multi_channel_burst_count",
+      "group": "Cross-source",
+      "source_constraint": "Từ nhiều nguồn; đúng thứ tự/cửa sổ"
+    },
+    {
+      "id": "P01",
+      "name": "active_days_last_7",
+      "group": "History",
+      "source_constraint": "Rolling past-only; không gồm ngày D"
+    },
+    {
+      "id": "P02",
+      "name": "active_days_last_30",
+      "group": "History",
+      "source_constraint": "Rolling past-only; không gồm ngày D"
+    },
+    {
+      "id": "P03",
+      "name": "total_events_mean_7d",
+      "group": "History",
+      "source_constraint": "Rolling past-only; không gồm ngày D"
+    },
+    {
+      "id": "P04",
+      "name": "total_events_mean_30d",
+      "group": "History",
+      "source_constraint": "Rolling past-only; không gồm ngày D"
+    },
+    {
+      "id": "P05",
+      "name": "total_events_std_30d",
+      "group": "History",
+      "source_constraint": "Rolling past-only; không gồm ngày D"
+    },
+    {
+      "id": "P06",
+      "name": "total_events_short_long_ratio",
+      "group": "History",
+      "source_constraint": "Rolling past-only; không gồm ngày D"
+    },
+    {
+      "id": "P07",
+      "name": "days_since_last_active_day",
+      "group": "History",
+      "source_constraint": "Rolling past-only; không gồm ngày D"
+    },
+    {
+      "id": "P08",
+      "name": "days_in_current_role",
+      "group": "History",
+      "source_constraint": "Rolling past-only; không gồm ngày D"
+    }
+  ]
+}

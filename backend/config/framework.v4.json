@@ -1,0 +1,197 @@
+{
+  "schema_version": "framework.v4",
+  "execution": {
+    "primary_materialization": "disk_backed_user_day_store",
+    "store_schema_version": "cert-user-day-store.v1",
+    "raw_read_strategy": "one_source_one_calendar_day_streaming",
+    "raw_content_selected": false,
+    "sqlite_cache_mib": 128,
+    "sqlite_mmap_mib": 256,
+    "recommended_batch_size_for_8gb_ram": 4,
+    "raw_source_resume": true,
+    "checkpoint_each_epoch": true
+  },
+  "training_sampling": {
+    "endpoint_policy": "WEEKLY_TRAIN",
+    "label_free": true,
+    "user_staggered": true,
+    "stagger_hash": "sha256(user_id)_first_4_bytes_little_endian_mod_7",
+    "window_days_reconstructed_per_endpoint": 30,
+    "reference_fit_uses_all_train_endpoints": true,
+    "validation_test_scoring_uses_full_ldap_universe": true
+  },
+  "primary_evaluation": {
+    "reference_update_mode": "FROZEN_AFTER_TRAIN",
+    "all_reference_levels_train_only": true,
+    "support_source": "stored_reference_artifact",
+    "client_supplied_support_allowed": false,
+    "content_policy": "METADATA_ONLY",
+    "ocean_policy": "ABLATION_ONLY",
+    "fallback_levels": ["PERSON", "ROLE", "GLOBAL"],
+    "department_team_are_fallback_levels": false
+  },
+  "timestamp_policy": {
+    "cert_basis": "LOCAL_WALL_CLOCK",
+    "unknown_timezone_conversion_allowed": false,
+    "storage_sentinel_timezone": "UTC",
+    "storage_sentinel_is_real_timezone_claim": false
+  },
+  "window_policy": {
+    "range": "[D-29,D]",
+    "future_days_allowed": false,
+    "inactive_employee_days_retained": true
+  },
+  "evaluation_universe": {
+    "unit": "employee_day",
+    "source": "effective_dated_ldap_role_assignment",
+    "include_inactive_days": true
+  },
+  "positive_label": {
+    "source": "CERT_r4.2_answer_files",
+    "unit": "incident_subject_user_day",
+    "positive_when": "subject has at least one answer-key event on D",
+    "other_actors_in_answer_file_excluded": true,
+    "incident_interval_expansion": false
+  },
+  "temporal_baseline": {
+    "fixed_business_hours": null,
+    "timezone_source": "organization",
+    "history_window_days": 30,
+    "history_policy": "past_only_primary_references_frozen_after_train",
+    "fallback_order": [
+      "PERSON",
+      "ROLE",
+      "GLOBAL"
+    ],
+    "person": {
+      "min_active_days": 30
+    },
+    "role": {
+      "min_peer_users": 15,
+      "min_peer_user_days": 300
+    },
+    "global": {
+      "min_users": 200,
+      "min_user_days": 10000,
+      "fit_train_only": true
+    },
+    "estimator": {
+      "center": "circular_mean",
+      "distance_location": "median",
+      "distance_scale": "1.4826*MAD",
+      "minimum_scale_minutes": 1.0
+    }
+  },
+  "readiness": {
+    "fallback_order": [
+      "PERSON",
+      "ROLE",
+      "GLOBAL"
+    ],
+    "feature": {
+      "person": {
+        "min_active_days": 30,
+        "min_span_days": 45,
+        "min_active_days_in_current_role": 30,
+        "min_feature_coverage_ratio": 0.9,
+        "min_observations_per_used_feature": 20,
+        "max_last_active_gap_days": 30
+      },
+      "role": {
+        "require_known_role": true,
+        "min_peer_users_excluding_subject": 15,
+        "min_peer_user_days": 300,
+        "min_recent_30d_user_days": 100,
+        "min_feature_coverage_ratio": 0.9,
+        "min_support_per_feature": 200
+      },
+      "global": {
+        "min_users": 200,
+        "min_user_days": 10000,
+        "min_feature_coverage_ratio": 0.9,
+        "fit_train_only": true
+      }
+    },
+    "sequence": {
+      "current_day": {
+        "min_seq_len": 2
+      },
+      "person": {
+        "min_sequence_days": 20,
+        "min_transitions": 500,
+        "min_span_days": 30,
+        "min_sequence_days_in_current_role": 20,
+        "max_stale_gap_days": 30
+      },
+      "role": {
+        "require_known_role": true,
+        "min_peer_users": 15,
+        "min_sequence_days": 300,
+        "min_transitions": 10000,
+        "min_recent_30d_transitions": 2000
+      },
+      "global": {
+        "min_users": 200,
+        "min_sequence_days": 10000,
+        "min_transitions": 100000,
+        "fit_train_only": true
+      }
+    }
+  },
+  "fusion": {
+    "weights": {
+      "feature": 0.5,
+      "sequence": 0.5
+    },
+    "renormalize_when_branch_missing": true
+  },
+  "decision": {
+    "alert_threshold": null,
+    "threshold_selection": {
+      "method": "validation_empirical_quantile",
+      "primary_quantile": 0.995,
+      "sensitivity_quantiles": [0.99, 0.999],
+      "labels_used": false,
+      "freeze_before_test": true
+    }
+  },
+  "safe_personalized_update": {
+    "primary_evaluation_enabled": false,
+    "production_enabled": true,
+    "quarantine_days": 7,
+    "reject_on_alert_in_quarantine_window": true,
+    "reject_on_role_epoch_change": true,
+    "materialization": "immutable_new_reference_version"
+  },
+  "pc_context": {
+    "fit_split": "TRAIN",
+    "unit": "distinct_user_day",
+    "shared_min_distinct_users": 5,
+    "shared_max_dominance_exclusive": 0.5,
+    "owner_min_dominance_inclusive": 0.5,
+    "tie_break": "user_id_ascending",
+    "freeze_after_train": true
+  },
+  "role_epoch": {
+    "reset_fields": ["role"],
+    "soft_context_fields": ["department", "team", "business_unit", "functional_unit"],
+    "reuse_closed_epoch": false,
+    "insufficient_role_support_fallback": "GLOBAL"
+  },
+  "splits": {
+    "date_format": "YYYY-MM-DD",
+    "inclusive_boundaries": true,
+    "train": {
+      "start": "2010-01-02",
+      "end": "2010-05-31"
+    },
+    "validation": {
+      "start": "2010-06-01",
+      "end": "2010-09-30"
+    },
+    "test": {
+      "start": "2010-10-01",
+      "end": "2011-05-17"
+    }
+  }
+}

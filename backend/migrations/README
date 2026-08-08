@@ -1,0 +1,5 @@
+Alembic migrations for the operational insider-threat database.
+
+The migration environment reads DATABASE_URL through app.settings and uses
+app.database.Base.metadata as the autogenerate target. Evaluation labels belong
+to the separate evaluation database and must never be added here.

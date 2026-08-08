@@ -1,0 +1,109 @@
+{
+  "schema_version": "sequence7.v4",
+  "runtime_materializer": {
+    "authoritative_implementation": "insider_ml.stream_store._sequence_from_payloads",
+    "store_schema_version": "cert-user-day-store.v1",
+    "implementation_checksum_required_in_preprocessing_artifact": true,
+    "score_position": "last day D only"
+  },
+  "pad_token": "PAD",
+  "tokens": [
+    "LOGON",
+    "LOGOFF",
+    "DEVICE_CONNECT",
+    "DEVICE_DISCONNECT",
+    "FILE",
+    "HTTP",
+    "EMAIL"
+  ],
+  "token_policy": {
+    "objective_event_types_only": true,
+    "http_risk_catalog_allowed": false,
+    "history_dependent_http_tokens_allowed": false,
+    "device_actions": {
+      "CONNECT": "DEVICE_CONNECT",
+      "DISCONNECT": "DEVICE_DISCONNECT"
+    }
+  },
+  "side_channel_ownership": {
+    "pc_contexts": "pipeline_train_only_pc_map",
+    "gap_buckets": "pipeline_from_canonical_timestamps",
+    "calendar_contexts": "pipeline_from_cert_local_wall_clock",
+    "time_sin_cos": "pipeline_from_cert_local_wall_clock",
+    "client_supplied_values_allowed": false
+  },
+  "max_len": 256,
+  "calendar_contexts": [
+    "WEEKDAY",
+    "WEEKEND"
+  ],
+  "continuous_side_channels": [
+    {
+      "name": "time_sin",
+      "formula": "sin(2*pi*minute_of_day/1440)",
+      "range": [-1.0, 1.0],
+      "pad_value": 0.0
+    },
+    {
+      "name": "time_cos",
+      "formula": "cos(2*pi*minute_of_day/1440)",
+      "range": [-1.0, 1.0],
+      "pad_value": 0.0
+    }
+  ],
+  "truncation": {
+    "strategy": "head_tail",
+    "head_events": 128,
+    "tail_events": 128
+  },
+  "gap_buckets": [
+    {"token": "0-1", "lower_minutes": 0, "upper_minutes": 1, "upper_inclusive": false},
+    {"token": "1-5", "lower_minutes": 1, "upper_minutes": 5, "upper_inclusive": false},
+    {"token": "5-30", "lower_minutes": 5, "upper_minutes": 30, "upper_inclusive": false},
+    {"token": "30-120", "lower_minutes": 30, "upper_minutes": 120, "upper_inclusive": true},
+    {"token": ">120", "lower_minutes": 120, "lower_inclusive": false}
+  ],
+  "categorical_id_maps": {
+    "event_token": {
+      "PAD": 0,
+      "LOGON": 1,
+      "LOGOFF": 2,
+      "DEVICE_CONNECT": 3,
+      "DEVICE_DISCONNECT": 4,
+      "FILE": 5,
+      "HTTP": 6,
+      "EMAIL": 7
+    },
+    "pc_context": {
+      "PAD": 0,
+      "OWN": 1,
+      "SHARED": 2,
+      "FOREIGN": 3,
+      "UNKNOWN": 4
+    },
+    "calendar_context": {
+      "PAD": 0,
+      "WEEKDAY": 1,
+      "WEEKEND": 2
+    },
+    "gap_bucket": {
+      "PAD": 0,
+      "0-1": 1,
+      "1-5": 2,
+      "5-30": 3,
+      "30-120": 4,
+      ">120": 5
+    }
+  },
+  "first_event_gap_policy": "elapsed_minutes=0, therefore gap_bucket_id=1",
+  "event_order": {
+    "keys": ["timestamp", "source_rank", "event_uid"],
+    "source_rank": {
+      "LOGON": 0,
+      "DEVICE": 1,
+      "FILE": 2,
+      "HTTP": 3,
+      "EMAIL": 4
+    }
+  }
+}
