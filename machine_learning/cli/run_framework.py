@@ -18,7 +18,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Execute a bounded real-CERT smoke run: prepare -> train -> "
-            "raw score -> frozen-reference calibration check."
+            "raw score. Capped smoke data never emits a production reference."
         )
     )
     parser.add_argument("--raw-root", type=Path, default=root / "data" / "raw" / "cert4.2")
@@ -36,6 +36,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-rows-per-source", type=int, default=10000)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--framework-config",
+        type=Path,
+        default=root / "backend" / "config" / "framework.v5.json",
+    )
     return parser.parse_args(argv)
 
 
@@ -50,8 +55,6 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     store = args.processed_dir / "user_days.sqlite"
     checkpoint = args.artifact_dir / "low_ram_tcn_transformer_ae.v4.pt"
     raw_scores = args.artifact_dir / "low_ram_train_raw_scores.csv"
-    references = args.artifact_dir / "low_ram_references.train.json"
-    predictions = args.artifact_dir / "low_ram_train_predictions.csv"
 
     common = [sys.executable, "-m"]
     _run(
@@ -84,6 +87,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "8",
             "--endpoint-policy",
             "weekly_train",
+            "--framework-config",
+            str(args.framework_config),
             "--device",
             "cpu",
         ]
@@ -100,39 +105,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             str(checkpoint),
             "--output",
             str(raw_scores),
-            "--fit-reference-out",
-            str(references),
+            "--framework-config",
+            str(args.framework_config),
             "--batch-size",
             str(args.batch_size),
-            "--max-samples",
-            "20",
             "--device",
             "cpu",
         ]
     )
-    _run(
-        [
-            *common,
-            "cli.score",
-            "--store",
-            str(store),
-            "--split",
-            "TRAIN",
-            "--checkpoint",
-            str(checkpoint),
-            "--output",
-            str(predictions),
-            "--reference-in",
-            str(references),
-            "--batch-size",
-            str(args.batch_size),
-            "--max-samples",
-            "20",
-            "--device",
-            "cpu",
-        ]
-    )
-    with predictions.open(newline="", encoding="utf-8") as handle:
+    with raw_scores.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     report = {
         "schema_version": "framework-smoke-run.v1",
@@ -141,16 +122,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "samples": len(rows),
         "raw_feature_scores": sum(bool(row["feature_raw"]) for row in rows),
         "raw_sequence_scores": sum(bool(row["sequence_raw"]) for row in rows),
-        "calibrated_scores": sum(bool(row["risk"]) for row in rows),
+        "calibrated_scores": 0,
+        "reference_fitted": False,
         "expected_smoke_no_score_reason": (
-            "The two-day shard intentionally cannot satisfy locked Person/Role/Global "
-            "readiness support."
+            "The bounded/capped shard is raw-only and cannot attest a complete "
+            "Train reference source."
         ),
         "store": str(store.resolve()),
         "store_size_bytes": store.stat().st_size,
         "checkpoint": str(checkpoint.resolve()),
-        "reference": str(references.resolve()),
-        "predictions": str(predictions.resolve()),
+        "reference": None,
+        "raw_scores": str(raw_scores.resolve()),
+        "predictions": None,
     }
     report_path = args.artifact_dir / "smoke_report.json"
     atomic_write_json(report_path, report)

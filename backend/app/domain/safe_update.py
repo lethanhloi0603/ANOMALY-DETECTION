@@ -27,6 +27,8 @@ class SafeUpdatePolicy:
     rolling_window_days: int
     rolling_influence_cap: float
     standalone_min_safe_scores: int
+    materialization_enabled: bool
+    activation_requires_zero_pending_legacy_candidates: bool
 
     @classmethod
     def from_framework(cls, config: Mapping[str, Any]) -> SafeUpdatePolicy:
@@ -34,6 +36,7 @@ class SafeUpdatePolicy:
         admission = raw["admission"]
         release = raw["release"]
         calibrator = raw["personal_calibrator"]
+        legacy_policy = raw["legacy_policy"]
         policy = cls(
             policy_version=str(raw["policy_version"]),
             admission_max_percentile_exclusive=float(
@@ -48,6 +51,10 @@ class SafeUpdatePolicy:
             standalone_min_safe_scores=int(
                 calibrator["standalone_min_safe_scores"]
             ),
+            materialization_enabled=release["materialization_enabled"],
+            activation_requires_zero_pending_legacy_candidates=legacy_policy[
+                "activation_requires_zero_pending_legacy_candidates"
+            ],
         )
         policy.validate()
         return policy
@@ -75,6 +82,15 @@ class SafeUpdatePolicy:
             raise ValueError("per-release influence cap cannot exceed rolling cap")
         if self.standalone_min_safe_scores < 1:
             raise ValueError("standalone Personal support must be positive")
+        if not isinstance(self.materialization_enabled, bool):
+            raise ValueError("materialization_enabled must be a boolean")
+        if not isinstance(
+            self.activation_requires_zero_pending_legacy_candidates,
+            bool,
+        ):
+            raise ValueError(
+                "activation_requires_zero_pending_legacy_candidates must be a boolean"
+            )
 
 
 @dataclass(frozen=True, slots=True)

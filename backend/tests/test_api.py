@@ -37,6 +37,7 @@ def configured_client(**setting_overrides: Any) -> Iterator[TestClient]:
         "api_key_actor": "test-api-principal",
         "scorer_api_key": None,
         "scorer_api_key_actor": "test-scorer-principal",
+        "safe_update_materialization_enabled": False,
         "locked_alert_threshold": 0.95,
         "cors_origins": (),
     }
@@ -111,6 +112,9 @@ def test_health_framework_and_openapi(client: TestClient) -> None:
     assert config["primary_evaluation"]["all_reference_levels_train_only"] is True
     assert config["primary_evaluation"]["client_supplied_support_allowed"] is False
     assert config["safe_personalized_update"]["primary_evaluation_enabled"] is False
+    assert config["safe_personalized_update"]["release"][
+        "materialization_enabled"
+    ] is False
     assert config["evaluation_universe"]["include_inactive_days"] is True
     assert config["timestamp_policy"]["cert_basis"] == "LOCAL_WALL_CLOCK"
     assert config["window_policy"]["range"] == "[D-29,D]"
@@ -132,6 +136,7 @@ def test_production_requires_general_and_scorer_api_keys(client: TestClient) -> 
                 api_key=None,
                 scorer_api_key="scorer-secret",
                 locked_alert_threshold=0.95,
+                safe_update_materialization_enabled=False,
             ),
             database_engine=engine,
         )
@@ -143,6 +148,7 @@ def test_production_requires_general_and_scorer_api_keys(client: TestClient) -> 
                 api_key="general-secret",
                 scorer_api_key=None,
                 locked_alert_threshold=0.95,
+                safe_update_materialization_enabled=False,
             ),
             database_engine=engine,
         )
@@ -154,6 +160,7 @@ def test_production_requires_general_and_scorer_api_keys(client: TestClient) -> 
                 api_key="shared-secret",
                 scorer_api_key="shared-secret",
                 locked_alert_threshold=0.95,
+                safe_update_materialization_enabled=False,
             ),
             database_engine=engine,
         )
@@ -166,6 +173,21 @@ def test_production_requires_general_and_scorer_api_keys(client: TestClient) -> 
                 api_key="general-secret",
                 scorer_api_key="scorer-secret",
                 locked_alert_threshold=None,
+                safe_update_materialization_enabled=False,
+            ),
+            database_engine=engine,
+        )
+
+    with pytest.raises(RuntimeError, match="requires a PostgreSQL DATABASE_URL"):
+        create_app(
+            replace(
+                settings,
+                app_env="production",
+                database_url="sqlite+pysqlite:///:memory:",
+                api_key="general-secret",
+                scorer_api_key="scorer-secret",
+                locked_alert_threshold=0.95,
+                safe_update_materialization_enabled=True,
             ),
             database_engine=engine,
         )
@@ -744,6 +766,7 @@ def create_reference(
     frozen: bool = True,
     as_of_date: str = "2010-06-01",
     fitted_through: str = "2010-05-31",
+    config_version: str = "framework.v5",
 ) -> str:
     response = client.post(
         "/api/v1/references",
@@ -753,7 +776,7 @@ def create_reference(
             "scope_key": scope_key,
             "as_of_date": as_of_date,
             "model_version": "baseline.v1",
-            "config_version": "framework.v5",
+            "config_version": config_version,
             "version": f"{branch.lower()}-{level.lower()}-{checksum_char}.v1",
             "fitted_through": fitted_through,
             "frozen": frozen,
@@ -807,9 +830,32 @@ def create_reference(
     assert response.json()["parent_reference_profile_id"] is None
     assert response.json()["calibration_parent_profile_id"] is None
     assert response.json()["reference_version"] is None
-    assert response.json()["release_kind"] is None
-    assert response.json()["policy_version"] == "framework.v5"
+    assert response.json()["release_kind"] == (
+        "LEGACY" if config_version == "framework.v4" else None
+    )
+    assert response.json()["policy_version"] == config_version
     return response.json()["id"]
+
+
+def test_framework_v4_reference_is_explicitly_exposed_as_legacy(
+    client: TestClient,
+) -> None:
+    create_identity(client)
+    profile_id = create_reference(
+        client,
+        branch="FEATURE",
+        level="GLOBAL",
+        scope_key="global",
+        checksum_char="9",
+        support={"user_days": 200},
+        config_version="framework.v4",
+    )
+
+    response = client.get(f"/api/v1/references/{profile_id}")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["release_kind"] == "LEGACY"
+    assert response.json()["policy_version"] == "framework.v4"
 
 
 def test_all_evaluation_reference_levels_are_frozen_train_only(

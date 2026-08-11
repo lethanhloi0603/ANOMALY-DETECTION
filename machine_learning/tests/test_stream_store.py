@@ -7,6 +7,7 @@ import numpy as np
 from insider_ml.dataset import SQLiteWindowDataset
 from insider_ml.stream_store import (
     SourceDayAccumulator,
+    TemporalReferenceState,
     connect_store,
     decode_day_payload,
     encode_day_payload,
@@ -68,6 +69,40 @@ def test_http_accumulator_never_persists_content_or_raw_url() -> None:
     assert "DO-NOT-PERSIST" not in rendered
     assert "private.example" not in rendered
     assert "raw-value" not in rendered
+
+
+def test_frozen_temporal_reference_keeps_immutable_train_support() -> None:
+    state = TemporalReferenceState()
+    role_epoch = "U001|Engineer|2010-01-02"
+    start = date(2010, 5, 2)
+    for offset in range(30):
+        state.add_train_day(
+            day=start + timedelta(days=offset),
+            user_id="U001",
+            role="Engineer",
+            role_epoch=role_epoch,
+            seconds=[8 * 60 * 60],
+        )
+
+    state.freeze()
+    frozen = state.select(
+        day=date(2010, 6, 1),
+        user_id="U001",
+        role="Engineer",
+        role_epoch=role_epoch,
+    )
+    assert frozen is not None
+    assert frozen.level == "PERSON"
+    assert frozen.observation_count == 30
+
+    state.expire(date(2010, 7, 1))
+    still_frozen = state.select(
+        day=date(2010, 7, 1),
+        user_id="U001",
+        role="Engineer",
+        role_epoch=role_epoch,
+    )
+    assert still_frozen == frozen
 
 
 def test_sqlite_window_dataset_reads_thirty_days_without_npz(tmp_path) -> None:

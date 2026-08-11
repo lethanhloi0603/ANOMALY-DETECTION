@@ -23,7 +23,7 @@ def _upgrade_config(database_url: str) -> Config:
     return config
 
 
-def test_0003_preserves_legacy_candidate_without_fabricating_evidence(
+def test_0004_corrects_legacy_eligibility_without_fabricating_evidence(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -48,6 +48,9 @@ def test_0003_preserves_legacy_candidate_without_fabricating_evidence(
     profile_id = uuid.uuid4().hex
     assessment_id = uuid.uuid4().hex
     candidate_id = uuid.uuid4().hex
+    already_corrected_id = uuid.uuid4().hex
+    v5_equality_id = uuid.uuid4().hex
+    v5_profile_id = uuid.uuid4().hex
     candidate_day = date(2026, 1, 1)
     quarantine_until = candidate_day + timedelta(days=7)
 
@@ -194,7 +197,7 @@ def test_0003_preserves_legacy_candidate_without_fabricating_evidence(
     engine = sa.create_engine(database_url)
     migrated = sa.MetaData()
     migrated.reflect(engine)
-    with engine.connect() as connection:
+    with engine.begin() as connection:
         assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
         assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
         candidate = connection.execute(
@@ -208,10 +211,104 @@ def test_0003_preserves_legacy_candidate_without_fabricating_evidence(
             )
         ).mappings().one()
 
+        # Revision 0003 produced the equality that 0004 must repair.
+        assert candidate["eligible_on"] == quarantine_until
+
+        already_corrected_day = candidate_day + timedelta(days=1)
+        already_corrected_quarantine = already_corrected_day + timedelta(days=7)
+        already_corrected_eligible = already_corrected_quarantine + timedelta(days=1)
+        already_corrected = dict(candidate)
+        already_corrected.update(
+            {
+                "id": already_corrected_id,
+                "candidate_day": already_corrected_day,
+                "quarantine_until": already_corrected_quarantine,
+                "eligible_on": already_corrected_eligible,
+            }
+        )
+        connection.execute(
+            migrated.tables["safe_update_candidates"].insert(),
+            already_corrected,
+        )
+
+        v5_day = candidate_day + timedelta(days=2)
+        v5_quarantine = v5_day + timedelta(days=30)
+        v5_equality = dict(candidate)
+        v5_equality.update(
+            {
+                "id": v5_equality_id,
+                "candidate_day": v5_day,
+                "quarantine_until": v5_quarantine,
+                "eligible_on": v5_quarantine,
+                "policy_version": "framework.v5.safe_update.v1",
+                "model_version": "v5-model",
+                "config_version": "framework.v5",
+                "influence_cap": 0.02,
+            }
+        )
+        connection.execute(
+            migrated.tables["safe_update_candidates"].insert(),
+            v5_equality,
+        )
+
+        v5_profile = dict(profile)
+        v5_profile.update(
+            {
+                "id": v5_profile_id,
+                "level": "global",
+                "scope_key": "global",
+                "user_id": None,
+                "role_id": None,
+                "role_assignment_id": None,
+                "model_version": "v5-model",
+                "config_version": "framework.v5",
+                "policy_version": "framework.v5",
+                "release_kind": None,
+                "checksum": "b" * 64,
+            }
+        )
+        connection.execute(
+            migrated.tables["reference_profiles"].insert(),
+            v5_profile,
+        )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+
+    engine = sa.create_engine(database_url)
+    migrated = sa.MetaData()
+    migrated.reflect(engine)
+    with engine.connect() as connection:
+        candidate = connection.execute(
+            sa.select(migrated.tables["safe_update_candidates"]).where(
+                migrated.tables["safe_update_candidates"].c.id == candidate_id
+            )
+        ).mappings().one()
+        already_corrected = connection.execute(
+            sa.select(migrated.tables["safe_update_candidates"]).where(
+                migrated.tables["safe_update_candidates"].c.id == already_corrected_id
+            )
+        ).mappings().one()
+        v5_equality = connection.execute(
+            sa.select(migrated.tables["safe_update_candidates"]).where(
+                migrated.tables["safe_update_candidates"].c.id == v5_equality_id
+            )
+        ).mappings().one()
+        profile = connection.execute(
+            sa.select(migrated.tables["reference_profiles"]).where(
+                migrated.tables["reference_profiles"].c.id == profile_id
+            )
+        ).mappings().one()
+        v5_profile = connection.execute(
+            sa.select(migrated.tables["reference_profiles"]).where(
+                migrated.tables["reference_profiles"].c.id == v5_profile_id
+            )
+        ).mappings().one()
+
         assert candidate["policy_version"] == "framework.v4.safe_update.v1"
         assert candidate["model_version"] == "legacy-model"
         assert candidate["config_version"] == "framework.v4"
-        assert candidate["eligible_on"] == quarantine_until
+        assert candidate["eligible_on"] == quarantine_until + timedelta(days=1)
         assert candidate["influence_cap"] == 0.05
         assert candidate["reference_profile_id"] == profile_id
         assert candidate["source_branch_score_id"] is None
@@ -223,7 +320,51 @@ def test_0003_preserves_legacy_candidate_without_fabricating_evidence(
         assert profile["parent_reference_profile_id"] is None
         assert profile["calibration_parent_profile_id"] is None
         assert profile["reference_version"] is None
-        assert profile["release_kind"] is None
+        assert profile["release_kind"] == "legacy"
+        assert v5_profile["release_kind"] is None
+
+        check_constraints = {
+            item["name"]: item["sqltext"]
+            for item in sa.inspect(connection).get_check_constraints("reference_profiles")
+        }
+        assert "legacy" in check_constraints[
+            "ck_reference_profiles_reference_profile_release_kind"
+        ]
+        release_constraints = {
+            item["name"]: item["sqltext"]
+            for item in sa.inspect(connection).get_check_constraints("reference_releases")
+        }
+        assert "legacy" not in release_constraints[
+            "ck_reference_releases_reference_release_materialized_kind"
+        ]
+
+        # The correction is narrowly scoped: it is idempotent for a legacy row
+        # that was already fixed and never reinterprets a v5 equality.
+        assert already_corrected["eligible_on"] == already_corrected_eligible
+        assert v5_equality["eligible_on"] == v5_quarantine
+    engine.dispose()
+
+    command.downgrade(config, "0003")
+    engine = sa.create_engine(database_url)
+    migrated = sa.MetaData()
+    migrated.reflect(engine)
+    with engine.begin() as connection:
+        candidates = migrated.tables["safe_update_candidates"]
+        corrected_after_downgrade = connection.scalar(
+            sa.select(candidates.c.eligible_on).where(candidates.c.id == candidate_id)
+        )
+        assert corrected_after_downgrade == quarantine_until + timedelta(days=1)
+        downgraded_release_kind = connection.scalar(
+            sa.select(migrated.tables["reference_profiles"].c.release_kind).where(
+                migrated.tables["reference_profiles"].c.id == profile_id
+            )
+        )
+        assert downgraded_release_kind is None
+        connection.execute(
+            sa.delete(candidates).where(
+                candidates.c.id.in_([already_corrected_id, v5_equality_id])
+            )
+        )
     engine.dispose()
 
     command.downgrade(config, "0002")

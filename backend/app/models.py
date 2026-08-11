@@ -185,6 +185,7 @@ class PersonalAccumulatorStatus(StrEnum):
 
 
 class ReferenceReleaseKind(StrEnum):
+    LEGACY = "legacy"
     BOOTSTRAP = "bootstrap"
     INCREMENTAL = "incremental"
 
@@ -1087,6 +1088,10 @@ class ReferenceRelease(UUIDPrimaryKeyMixin, Base):
             "(kind = 'incremental' AND parent_reference_profile_id IS NOT NULL)",
             name="reference_release_parent_shape",
         ),
+        CheckConstraint(
+            "kind IN ('bootstrap', 'incremental')",
+            name="reference_release_materialized_kind",
+        ),
         Index(
             "ix_reference_releases_accumulator_day",
             "accumulator_id",
@@ -1411,6 +1416,24 @@ def _validate_reference_lineage(session: Session, profile: ReferenceProfile) -> 
         0 <= profile.release_influence_ratio <= 1
     ):
         raise ValueError("Reference release influence ratio must be in [0,1]")
+    if profile.release_kind is ReferenceReleaseKind.LEGACY:
+        if (
+            profile.config_version != "framework.v4"
+            or profile.policy_version != "framework.v4"
+        ):
+            raise ValueError("Legacy reference lineage is restricted to framework.v4 profiles")
+        if any(
+            value is not None
+            for value in (
+                profile.parent_reference_profile_id,
+                profile.calibration_parent_profile_id,
+                profile.reference_version,
+                profile.release_day,
+                profile.release_influence_ratio,
+            )
+        ):
+            raise ValueError("Legacy references cannot claim v5 release lineage")
+        return
     if profile.release_kind is None:
         if any(
             value is not None
@@ -1505,6 +1528,11 @@ def _validate_accumulator(
 
 
 def _validate_reference_release(session: Session, release: ReferenceRelease) -> None:
+    if release.kind not in (
+        ReferenceReleaseKind.BOOTSTRAP,
+        ReferenceReleaseKind.INCREMENTAL,
+    ):
+        raise ValueError("Legacy references cannot be materialized release events")
     accumulator = session.get(PersonalReferenceAccumulator, release.accumulator_id)
     child = session.get(ReferenceProfile, release.child_reference_profile_id)
     calibration_parent = session.get(

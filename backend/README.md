@@ -18,7 +18,14 @@ are read from `../machine_learning/config`.
 Scoring requires `LOCKED_ALERT_THRESHOLD`, exported from the label-free
 Validation 99.5th-percentile decision and frozen before Test. Primary
 Validation/Test references are Train-fitted and immutable; safe personalized
-updates run only for `PRODUCTION` after a seven-day quarantine.
+updates run only for `PRODUCTION` after the closed quarantine window `[D,D+30]`;
+the earliest eligible day is `D+31` and every day in the window requires a
+complete scoring watermark.
+
+Personal reference materialization is fail-closed behind both the versioned
+framework gate and `SAFE_UPDATE_MATERIALIZATION_ENABLED`. Keep both disabled for
+shadow rollout. See [`../docs/safe-update-rollout.md`](../docs/safe-update-rollout.md)
+for the activation prerequisites.
 
 The scoring request supplies raw branch errors only. Readiness support and
 calibration come from stored pipeline-built references. Sequence PC context,

@@ -182,6 +182,7 @@
       "rolling_window_days": 30,
       "rolling_influence_cap": 0.1,
       "bootstrap_exempt_from_influence_caps": true,
+      "materialization_enabled": false,
       "materialization": "IMMUTABLE_NEW_REFERENCE_VERSION"
     },
     "personal_calibrator": {

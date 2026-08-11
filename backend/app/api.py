@@ -1007,6 +1007,9 @@ def post_safe_update_process(
         organization,
         model_version=payload.model_version,
         config_version=payload.config_version,
+        runtime_materialization_enabled=(
+            request.app.state.settings.safe_update_materialization_enabled
+        ),
         limit=payload.limit,
         actor=actor,
         request_id=request_id,

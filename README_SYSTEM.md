@@ -165,6 +165,10 @@ machine_learning/
 | `cli.run_framework` | Smoke end-to-end có giới hạn trên dữ liệu CERT thật |
 | `cli.run_experiment` | Chạy toàn bộ pipeline đến Test metric |
 
+`cli.prepare_cert` mặc định giới hạn 25 user và luôn ghi `max_users` vào manifest. Artifact từ
+user shard chỉ dùng cho smoke/research; production reference yêu cầu nguồn không giới hạn user
+và pipeline SQLite đầy đủ.
+
 ### 3.2. Thư mục `backend/`
 
 Chứa lớp vận hành: FastAPI, persistence, alert workflow, audit và safe-update
@@ -513,7 +517,8 @@ Hai phía dùng chung schema/rule version nhưng hiện không có job tự đ�
 của `run_experiment` vào backend.
 
 Safe personalized update bị loại khỏi primary experiment. Backend chỉ cho phép workflow
-này ở production, sau quarantine 7 ngày và không nhận ngày đã alert.
+này ở production, sau cửa sổ quarantine đóng `[D,D+30]`; ngày sớm nhất đủ điều
+kiện là `D+31`, với đầy đủ scoring watermark và không có alert trong cửa sổ.
 
 ## 12. Artifact, version và khả năng resume
 

@@ -352,7 +352,8 @@ cho `PRODUCTION` và phải được báo cáo như thí nghiệm online riêng.
 1. **Score-first**: ngày D chưa nằm trong personal profile.
 2. **Candidate**: tạo `SafeUpdateCandidate` gắn với assessment, branch, role assignment và
    reference profile.
-3. **Quarantine**: chờ mặc định 7 ngày; `quarantine_until` không được trước candidate day.
+3. **Quarantine**: kiểm tra cửa sổ đóng `[D,D+30]`; `quarantine_until=D+30` và
+   ngày đủ điều kiện sớm nhất là `eligible_on=D+31`.
 4. **Reject**: không update nếu ngày D hoặc bất kỳ ngày nào trong cửa sổ quarantine có alert,
    hoặc role epoch đã thay đổi.
 5. **Accept**: sau quarantine và không có điều kiện reject, tạo candidate được chấp nhận để

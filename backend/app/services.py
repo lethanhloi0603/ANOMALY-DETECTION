@@ -1600,6 +1600,12 @@ def create_reference_profile(
         support_json=support,
         statistics_json=payload.statistics,
         calibrator_json=calibrator,
+        release_kind=(
+            ReferenceReleaseKind.LEGACY
+            if payload.config_version == "framework.v4"
+            else None
+        ),
+        policy_version=payload.config_version,
         is_frozen=payload.frozen,
         checksum=payload.checksum,
     )
@@ -4042,6 +4048,7 @@ def process_safe_updates(
     *,
     model_version: str,
     config_version: str,
+    runtime_materialization_enabled: bool,
     limit: int,
     actor: str,
     request_id: str,
@@ -4057,6 +4064,45 @@ def process_safe_updates(
             },
         )
     policy = SafeUpdatePolicy.from_framework(framework_config)
+    materialization_enabled = (
+        policy.materialization_enabled and runtime_materialization_enabled
+    )
+    legacy_pending = int(
+        session.scalar(
+            select(func.count(SafeUpdateCandidate.id)).where(
+                SafeUpdateCandidate.organization_id == organization.id,
+                SafeUpdateCandidate.status.in_(
+                    [UpdateStatus.CANDIDATE, UpdateStatus.ACCEPTED]
+                ),
+                SafeUpdateCandidate.policy_version != policy.policy_version,
+            )
+        )
+        or 0
+    )
+    global_legacy_pending = False
+    if materialization_enabled and policy.activation_requires_zero_pending_legacy_candidates:
+        global_legacy_pending = (
+            session.scalar(
+                select(SafeUpdateCandidate.id)
+                .where(
+                    SafeUpdateCandidate.status.in_(
+                        [UpdateStatus.CANDIDATE, UpdateStatus.ACCEPTED]
+                    ),
+                    SafeUpdateCandidate.policy_version != policy.policy_version,
+                )
+                .limit(1)
+            )
+            is not None
+        )
+    if global_legacy_pending:
+        raise DomainValidationError(
+            "SAFE_UPDATE_LEGACY_PENDING",
+            "immutable v5 materialization requires all legacy candidates to be retired",
+            {
+                "global_legacy_pending": True,
+                "organization_legacy_pending": legacy_pending,
+            },
+        )
     rejected_before = int(
         session.scalar(
             select(func.count(SafeUpdateCandidate.id)).where(
@@ -4144,33 +4190,34 @@ def process_safe_updates(
             session.flush()
         session.flush()
 
-        accumulator_ids = list(
-            session.scalars(
-                select(SafeUpdateCandidate.accumulator_id)
-                .where(
-                    SafeUpdateCandidate.organization_id == organization.id,
-                    SafeUpdateCandidate.status == UpdateStatus.ACCEPTED,
-                    SafeUpdateCandidate.policy_version == policy.policy_version,
-                    SafeUpdateCandidate.model_version == model_version,
-                    SafeUpdateCandidate.config_version == config_version,
-                    SafeUpdateCandidate.accumulator_id.is_not(None),
+        if materialization_enabled:
+            accumulator_ids = list(
+                session.scalars(
+                    select(SafeUpdateCandidate.accumulator_id)
+                    .where(
+                        SafeUpdateCandidate.organization_id == organization.id,
+                        SafeUpdateCandidate.status == UpdateStatus.ACCEPTED,
+                        SafeUpdateCandidate.policy_version == policy.policy_version,
+                        SafeUpdateCandidate.model_version == model_version,
+                        SafeUpdateCandidate.config_version == config_version,
+                        SafeUpdateCandidate.accumulator_id.is_not(None),
+                    )
+                    .distinct()
                 )
-                .distinct()
             )
-        )
-        for accumulator_id in sorted(accumulator_ids, key=str):
-            if accumulator_id is None:
-                continue
-            applied += _materialize_accumulator(
-                session,
-                organization,
-                accumulator_id,
-                logical_day=logical_day,
-                framework_config=framework_config,
-                policy=policy,
-                actor=actor,
-                request_id=request_id,
-            )
+            for accumulator_id in sorted(accumulator_ids, key=str):
+                if accumulator_id is None:
+                    continue
+                applied += _materialize_accumulator(
+                    session,
+                    organization,
+                    accumulator_id,
+                    logical_day=logical_day,
+                    framework_config=framework_config,
+                    policy=policy,
+                    actor=actor,
+                    request_id=request_id,
+                )
 
     rejected_after = int(
         session.scalar(
@@ -4206,18 +4253,6 @@ def process_safe_updates(
                 SafeUpdateCandidate.policy_version == policy.policy_version,
                 SafeUpdateCandidate.model_version == model_version,
                 SafeUpdateCandidate.config_version == config_version,
-            )
-        )
-        or 0
-    )
-    legacy_pending = int(
-        session.scalar(
-            select(func.count(SafeUpdateCandidate.id)).where(
-                SafeUpdateCandidate.organization_id == organization.id,
-                SafeUpdateCandidate.status.in_(
-                    [UpdateStatus.CANDIDATE, UpdateStatus.ACCEPTED]
-                ),
-                SafeUpdateCandidate.policy_version != policy.policy_version,
             )
         )
         or 0

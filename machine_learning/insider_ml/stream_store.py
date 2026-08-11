@@ -716,6 +716,10 @@ class RollingTemporalReference:
     def frozen_copy(self) -> RollingTemporalReference:
         result = RollingTemporalReference()
         result.histogram = self.histogram.copy()
+        result.entries = deque(
+            (day, user_id, histogram.copy())
+            for day, user_id, histogram in self.entries
+        )
         result.users = self.users.copy()
         return result
 

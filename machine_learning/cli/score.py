@@ -7,9 +7,9 @@ import hashlib
 import json
 import math
 from collections import defaultdict
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import asdict
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from statistics import fmean
 from typing import Any
@@ -19,7 +19,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from insider_ml.artifacts import atomic_write_csv, atomic_write_json
-from insider_ml.cert_data import LdapDirectory
+from insider_ml.cert_data import SOURCE_FILES, LdapDirectory
+from insider_ml.contracts import TRAIN_END, TRAIN_START
 from insider_ml.dataset import (
     SQLiteWindowDataset,
     WindowDataset,
@@ -32,6 +33,14 @@ from insider_ml.inference import (
     fit_reference,
 )
 from insider_ml.model import build_model
+from insider_ml.stream_store import connect_store, metadata_get
+
+ENTRY_CONTRACT_VERSION = "hierarchical-reference-entry.v1"
+_ENTRY_CHECKSUM_FIELDS = ("identity", "stats", "support", "calibrator")
+REFERENCE_ENDPOINT_POLICY = "ALL"
+FEATURE_SCHEMA_VERSION = "feature128.v5"
+SEQUENCE_SCHEMA_VERSION = "sequence7.v4"
+FEATURE_VALUE_SPACE = "robust_scaled"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -73,6 +82,161 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _canonical_json_sha256(payload: object) -> str:
+    """Hash the exact JSON contract representation used by reference entries."""
+
+    try:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("reference entry is not canonical finite JSON") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _reference_entry_checksum(entry: dict[str, Any]) -> str:
+    try:
+        payload = {field: entry[field] for field in _ENTRY_CHECKSUM_FIELDS}
+    except KeyError as exc:
+        raise ValueError("reference entry is missing checksum material") from exc
+    return _canonical_json_sha256(payload)
+
+
+def _seal_reference_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    entry["entry_checksum_sha256"] = _reference_entry_checksum(entry)
+    return entry
+
+
+def _validate_complete_source_attestation(
+    attestation: object,
+    *,
+    require_source_sha256: bool,
+) -> dict[str, Any]:
+    if (
+        not isinstance(attestation, dict)
+        or attestation.get("schema_version")
+        != "reference-source-attestation.v1"
+        or attestation.get("complete_train") is not True
+        or not isinstance(attestation.get("source"), str)
+        or not attestation["source"]
+        or (
+            require_source_sha256
+            and not _is_sha256(attestation.get("source_sha256"))
+        )
+    ):
+        raise ValueError("source attestation is not a complete Train contract")
+
+    source_kind = attestation.get("kind")
+    if source_kind == "sqlite_user_day_store":
+        try:
+            attested_end = date.fromisoformat(
+                str(attestation["daily_materialization_end_day"])
+            )
+        except (KeyError, ValueError) as exc:
+            raise ValueError("store attestation has an invalid end day") from exc
+        attested_sources = attestation.get("sources")
+        if (
+            attested_end < TRAIN_END
+            or not _is_sha256(attestation.get("daily_materialization_signature"))
+            or not isinstance(attested_sources, dict)
+            or set(attested_sources) != set(SOURCE_FILES)
+            or any(
+                not isinstance(completion, dict)
+                or "max_rows" not in completion
+                or completion["max_rows"] is not None
+                or not isinstance(completion.get("fingerprint"), dict)
+                for completion in attested_sources.values()
+            )
+        ):
+            raise ValueError("store attestation is incomplete")
+    elif source_kind == "prepared_windows_npz":
+        if (
+            attestation.get("start_day") != TRAIN_START.isoformat()
+            or attestation.get("end_day") != TRAIN_END.isoformat()
+            or attestation.get("endpoint_policy") != REFERENCE_ENDPOINT_POLICY
+            or "max_users" not in attestation
+            or attestation["max_users"] is not None
+            or isinstance(attestation.get("selected_user_count"), bool)
+            or not isinstance(attestation.get("selected_user_count"), int)
+            or attestation["selected_user_count"] < 1
+            or not _is_sha256(attestation.get("source_sha256"))
+            or not _is_sha256(attestation.get("manifest_sha256"))
+            or not isinstance(attestation.get("manifest"), str)
+            or not attestation["manifest"]
+            or isinstance(attestation.get("samples"), bool)
+            or not isinstance(attestation.get("samples"), int)
+            or attestation["samples"] < 1
+        ):
+            raise ValueError("NPZ attestation is incomplete")
+    else:
+        raise ValueError("source attestation kind is unsupported")
+    return attestation
+
+
+def _validate_checkpoint_training_contract(
+    checkpoint: Mapping[str, Any],
+    *,
+    framework_config: Mapping[str, Any],
+    framework_config_checksum: str,
+) -> None:
+    """Require a complete, frozen Train checkpoint for reference calibration."""
+
+    if (
+        checkpoint.get("fit_split") != "TRAIN"
+        or checkpoint.get("frozen_after_train") is not True
+    ):
+        raise ValueError("reference calibration requires a frozen Train checkpoint")
+    try:
+        expected_endpoint_policy = str(
+            framework_config["training_sampling"]["endpoint_policy"]
+        ).upper()
+    except (KeyError, TypeError) as exc:
+        raise ValueError("framework config has no training sampling contract") from exc
+    if (
+        framework_config.get("schema_version") != "framework.v5"
+        or expected_endpoint_policy != "WEEKLY_TRAIN"
+        or framework_config["training_sampling"].get(
+            "reference_fit_uses_all_train_endpoints"
+        )
+        is not True
+        or checkpoint.get("framework_schema_version") != "framework.v5"
+        or checkpoint.get("framework_config_sha256") != framework_config_checksum
+        or checkpoint.get("training_endpoint_policy") != expected_endpoint_policy
+        or checkpoint.get("feature_schema_version") != FEATURE_SCHEMA_VERSION
+        or checkpoint.get("sequence_schema_version") != SEQUENCE_SCHEMA_VERSION
+        or checkpoint.get("feature_value_space") != FEATURE_VALUE_SPACE
+        or not _is_sha256(checkpoint.get("preprocessing_checksum"))
+        or not _is_sha256(checkpoint.get("scaler_checksum"))
+        or isinstance(checkpoint.get("training_samples"), bool)
+        or not isinstance(checkpoint.get("training_samples"), int)
+        or checkpoint["training_samples"] < 1
+    ):
+        raise ValueError(
+            "reference calibration requires the locked framework.v5 training contract"
+        )
+    try:
+        _validate_complete_source_attestation(
+            checkpoint.get("training_source_attestation"),
+            require_source_sha256=True,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "reference calibration requires a complete Train checkpoint source"
+        ) from exc
+
+
 def _load_framework_config(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -85,9 +249,166 @@ def _load_framework_config(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _validate_store_reference_source(path: Path) -> dict[str, Any]:
+    connection = connect_store(path, read_only=True)
+    try:
+        if metadata_get(connection, "daily_materialization_complete") != "true":
+            raise ValueError(
+                "reference fitting requires a completed daily tensor store"
+            )
+        raw_end_day = metadata_get(connection, "daily_materialization_end_day")
+        try:
+            end_day = date.fromisoformat(str(raw_end_day))
+        except ValueError as exc:
+            raise ValueError(
+                "reference fitting store has no valid materialization end day"
+            ) from exc
+        if end_day < TRAIN_END:
+            raise ValueError(
+                "reference fitting store does not cover the locked Train end"
+            )
+
+        source_attestations: dict[str, dict[str, Any]] = {}
+        for source in SOURCE_FILES:
+            raw_completion = metadata_get(connection, f"source_complete_{source}")
+            if raw_completion is None:
+                raise ValueError(
+                    f"reference fitting store is missing completion metadata for {source}"
+                )
+            try:
+                completion = json.loads(raw_completion)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"reference fitting store has invalid completion metadata for {source}"
+                ) from exc
+            if not isinstance(completion, dict) or not isinstance(
+                completion.get("fingerprint"), dict
+            ):
+                raise ValueError(
+                    f"reference fitting store has invalid completion metadata for {source}"
+                )
+            if "max_rows" not in completion or completion["max_rows"] is not None:
+                raise ValueError(
+                    f"reference fitting refuses capped source {source}"
+                )
+            source_attestations[source] = completion
+
+        materialization_signature = metadata_get(
+            connection,
+            "daily_materialization_signature",
+        )
+        if not _is_sha256(materialization_signature):
+            raise ValueError(
+                "reference fitting store has no valid materialization signature"
+            )
+    finally:
+        connection.close()
+
+    return {
+        "schema_version": "reference-source-attestation.v1",
+        "kind": "sqlite_user_day_store",
+        "complete_train": True,
+        "source": str(path.resolve()),
+        "daily_materialization_end_day": end_day.isoformat(),
+        "daily_materialization_signature": materialization_signature,
+        "sources": source_attestations,
+    }
+
+
+def _validate_prepared_reference_source(
+    path: Path,
+    *,
+    preprocessing_checksum: str,
+    scaler_checksum: str,
+    sample_count: int,
+    feature_schema_version: str,
+    sequence_schema_version: str,
+) -> dict[str, Any]:
+    manifest_path = path.with_suffix(path.suffix + ".manifest.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "reference fitting from NPZ requires its preparation manifest beside the input"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("preparation manifest root must be an object")
+    if manifest.get("schema_version") != "cert-preparation-manifest.v1":
+        raise ValueError("reference fitting requires cert-preparation-manifest.v1")
+    if manifest.get("split") != "TRAIN":
+        raise ValueError("reference fitting preparation manifest must attest TRAIN")
+    if (
+        manifest.get("start_day") != TRAIN_START.isoformat()
+        or manifest.get("end_day") != TRAIN_END.isoformat()
+    ):
+        raise ValueError(
+            "reference fitting preparation manifest must cover the exact locked Train range"
+        )
+    if (
+        "smoke_row_cap_per_source" not in manifest
+        or manifest["smoke_row_cap_per_source"] is not None
+    ):
+        raise ValueError("reference fitting refuses a capped NPZ source")
+    if "max_users" not in manifest or manifest["max_users"] is not None:
+        raise ValueError("reference fitting refuses a user-capped NPZ source")
+    users = manifest.get("users")
+    selected_user_count = manifest.get("selected_user_count")
+    if (
+        not isinstance(users, list)
+        or not users
+        or any(not isinstance(user_id, str) or not user_id for user_id in users)
+        or len(set(users)) != len(users)
+        or isinstance(selected_user_count, bool)
+        or not isinstance(selected_user_count, int)
+        or selected_user_count != len(users)
+    ):
+        raise ValueError("preparation manifest has invalid selected-user evidence")
+    if manifest.get("endpoint_policy") != REFERENCE_ENDPOINT_POLICY:
+        raise ValueError(
+            "reference fitting NPZ must contain all locked Train endpoints"
+        )
+    try:
+        manifested_output = Path(str(manifest["output"])).resolve()
+    except KeyError as exc:
+        raise ValueError("preparation manifest does not identify its output") from exc
+    if manifested_output != path.resolve():
+        raise ValueError("preparation manifest output path does not match the NPZ input")
+    input_checksum = _sha256(path)
+    if manifest.get("output_sha256") != input_checksum:
+        raise ValueError("preparation manifest output checksum does not match the NPZ input")
+    expected_fields = {
+        "preprocessing_checksum": preprocessing_checksum,
+        "scaler_checksum": scaler_checksum,
+        "samples": sample_count,
+        "feature_schema_version": feature_schema_version,
+        "sequence_schema_version": sequence_schema_version,
+    }
+    for field_name, expected in expected_fields.items():
+        if manifest.get(field_name) != expected:
+            raise ValueError(
+                f"preparation manifest {field_name} does not match the NPZ input"
+            )
+    return {
+        "schema_version": "reference-source-attestation.v1",
+        "kind": "prepared_windows_npz",
+        "complete_train": True,
+        "source": str(path.resolve()),
+        "source_sha256": input_checksum,
+        "manifest": str(manifest_path.resolve()),
+        "manifest_sha256": _sha256(manifest_path),
+        "start_day": TRAIN_START.isoformat(),
+        "end_day": TRAIN_END.isoformat(),
+        "endpoint_policy": REFERENCE_ENDPOINT_POLICY,
+        "max_users": None,
+        "selected_user_count": selected_user_count,
+        "samples": sample_count,
+    }
+
+
 def _validate_reference_artifact_contract(
     artifact: dict[str, Any],
     *,
+    framework_config: dict[str, Any],
     framework_config_checksum: str,
 ) -> None:
     schema_version = artifact.get("schema_version")
@@ -111,6 +432,21 @@ def _validate_reference_artifact_contract(
         raise ValueError("reference artifact does not embed its framework config")
     if embedded_config.get("schema_version") != "framework.v5":
         raise ValueError("embedded reference config is not framework.v5")
+    if embedded_config != framework_config:
+        raise ValueError(
+            "embedded reference framework config does not match the scoring config"
+        )
+    try:
+        _validate_complete_source_attestation(
+            artifact.get("source_attestation"),
+            require_source_sha256=False,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "reference artifact does not contain a complete Train source attestation"
+        ) from exc
+
+    _validate_reference_branches(artifact, framework_config)
 
 
 def _role(directory: LdapDirectory, user_id: str, day: date) -> str:
@@ -248,6 +584,201 @@ def _reference_to_json(reference: ReferenceStats) -> dict[str, Any]:
     return value
 
 
+def _standalone_personal_target(framework_config: dict[str, Any]) -> int:
+    try:
+        calibrator_config = framework_config["safe_personalized_update"][
+            "personal_calibrator"
+        ]
+        target = calibrator_config["standalone_min_safe_scores"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("framework config has no Personal calibrator contract") from exc
+    if (
+        isinstance(target, bool)
+        or not isinstance(target, int)
+        or target != 200
+        or calibrator_config.get("below_min_method") != "parent_shrunk_ecdf.v1"
+    ):
+        raise ValueError("framework config has an invalid Personal calibrator contract")
+    return target
+
+
+def _build_reference_entry(
+    *,
+    branch: str,
+    level: str,
+    scope_key: str,
+    scope_rows: list[dict[str, Any]],
+    score_name: str,
+    train_end: date,
+) -> dict[str, Any]:
+    scores = np.asarray([row[score_name] for row in scope_rows], dtype=np.float64)
+    stats = fit_reference(level, scope_key, scores)
+    days = sorted({str(row["day"]) for row in scope_rows})
+    users = sorted({str(row["user_id"]) for row in scope_rows})
+    roles = sorted({str(row["role"]) for row in scope_rows})
+    if level == "PERSON":
+        if len(users) != 1 or len(roles) != 1:
+            raise ValueError("Personal reference scope must identify one user and role")
+        subject_user_id: str | None = users[0]
+        role: str | None = roles[0]
+    elif level == "ROLE":
+        if roles != [scope_key]:
+            raise ValueError("Role reference scope does not match its rows")
+        subject_user_id = None
+        role = scope_key
+    else:
+        subject_user_id = None
+        role = None
+
+    recent_rows = [
+        row
+        for row in scope_rows
+        if 0 <= (train_end - date.fromisoformat(str(row["day"]))).days <= 29
+    ]
+    feature_support = np.zeros(128, dtype=np.int64)
+    for row in scope_rows:
+        packed = np.frombuffer(row["_feature_mask"], dtype=np.uint8)
+        feature_support += np.unpackbits(packed, bitorder="little")[:128]
+    support = {
+        "observations": len(scope_rows),
+        "feature_observation_days": len(scope_rows),
+        "observations_by_user": {
+            user: sum(str(row["user_id"]) == user for row in scope_rows)
+            for user in users
+        },
+        "users": len(users),
+        "user_ids": users,
+        "span_days": (
+            (date.fromisoformat(days[-1]) - date.fromisoformat(days[0])).days + 1
+            if days
+            else 0
+        ),
+        "transitions": sum(
+            max(int(row["sequence_length"]) - 1, 0) for row in scope_rows
+        ),
+        "transitions_by_user": {
+            user: sum(
+                max(int(row["sequence_length"]) - 1, 0)
+                for row in scope_rows
+                if str(row["user_id"]) == user
+            )
+            for user in users
+        },
+        "sequence_days": sum(
+            int(row["sequence_length"]) >= 2 for row in scope_rows
+        ),
+        "sequence_days_by_user": {
+            user: sum(
+                int(row["sequence_length"]) >= 2
+                for row in scope_rows
+                if str(row["user_id"]) == user
+            )
+            for user in users
+        },
+        "active_days": sum(bool(row["active"]) for row in scope_rows),
+        "mean_feature_coverage": fmean(
+            float(row["feature_coverage"]) for row in scope_rows
+        ),
+        "feature_coverage_ratio_at_20": float(np.mean(feature_support >= 20)),
+        "feature_coverage_ratio_at_40": float(np.mean(feature_support >= 40)),
+        "feature_coverage_ratio_at_200": float(np.mean(feature_support >= 200)),
+        "minimum_nonzero_feature_support": int(
+            feature_support[feature_support > 0].min()
+            if np.any(feature_support > 0)
+            else 0
+        ),
+        # Safe-update v5 must be able to extend a Feature reference without
+        # reconstructing historical masks. Preserve the immutable denominator.
+        "feature_observation_counts": [
+            int(value) for value in feature_support.tolist()
+        ],
+        "last_active_day": max(
+            (str(row["day"]) for row in scope_rows if bool(row["active"])),
+            default=None,
+        ),
+        "last_sequence_day": max(
+            (
+                str(row["day"])
+                for row in scope_rows
+                if int(row["sequence_length"]) >= 2
+            ),
+            default=None,
+        ),
+        "recent_30d_observations": len(recent_rows),
+        "recent_30d_observations_by_user": {
+            user: sum(str(row["user_id"]) == user for row in recent_rows)
+            for user in users
+        },
+        "recent_30d_transitions": sum(
+            max(int(row["sequence_length"]) - 1, 0) for row in recent_rows
+        ),
+        "recent_30d_transitions_by_user": {
+            user: sum(
+                max(int(row["sequence_length"]) - 1, 0)
+                for row in recent_rows
+                if str(row["user_id"]) == user
+            )
+            for user in users
+        },
+    }
+    return {
+        "entry_schema_version": ENTRY_CONTRACT_VERSION,
+        "identity": {
+            "branch": branch,
+            "level": level,
+            "scope_key": scope_key,
+            "subject_user_id": subject_user_id,
+            "role": role,
+        },
+        "stats": _reference_to_json(stats),
+        "support": support,
+        "calibrator": {"method": "empirical_cdf.v1"},
+    }
+
+
+def _select_personal_parent(
+    *,
+    branch: str,
+    person_entry: dict[str, Any],
+    levels: dict[str, dict[str, dict[str, Any]]],
+    framework_config: dict[str, Any],
+) -> tuple[str, str, dict[str, Any]] | None:
+    identity = person_entry["identity"]
+    subject_user_id = str(identity["subject_user_id"])
+    role = str(identity["role"])
+    try:
+        parent_order = framework_config["safe_personalized_update"]["admission"][
+            "parent_order"
+        ]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("framework config has no Personal parent order") from exc
+    if parent_order != ["ROLE", "GLOBAL"]:
+        raise ValueError("framework config has an invalid Personal parent order")
+
+    train_end = date.fromisoformat(framework_config["splits"]["train"]["end"])
+    sequence_length = (
+        int(framework_config["readiness"][branch]["current_day"]["min_seq_len"])
+        if branch == "sequence"
+        else 0
+    )
+    for level in parent_order:
+        scope_key = role if level == "ROLE" else "GLOBAL"
+        entry = levels[level].get(scope_key)
+        if entry is not None and _ready(
+            branch=branch,
+            level=level,
+            entry=entry,
+            user_id=subject_user_id,
+            sequence_length=sequence_length,
+            day=(train_end + timedelta(days=1)).isoformat(),
+            split="VALIDATION",
+            role=role,
+            framework_config=framework_config,
+        ):
+            return level, scope_key, entry
+    return None
+
+
 def _fit_reference_artifact(
     rows: list[dict[str, Any]],
     *,
@@ -256,11 +787,13 @@ def _fit_reference_artifact(
     scaler_checksum: str,
     framework_config: dict[str, Any],
     framework_config_checksum: str,
+    source_attestation: dict[str, Any],
 ) -> dict[str, Any]:
     if {row["split"] for row in rows} != {"TRAIN"}:
         raise ValueError("reference fitting accepts Train rows only")
     artifact: dict[str, Any] = {
         "schema_version": "hierarchical-reference.v2",
+        "entry_contract_version": ENTRY_CONTRACT_VERSION,
         "framework_schema_version": framework_config["schema_version"],
         "framework_config_sha256": framework_config_checksum,
         "framework_config": framework_config,
@@ -269,6 +802,7 @@ def _fit_reference_artifact(
         "checkpoint_sha256": _sha256(checkpoint_path),
         "preprocessing_checksum": preprocessing_checksum,
         "scaler_checksum": scaler_checksum,
+        "source_attestation": source_attestation,
         "branches": {},
     }
     for branch, score_name in (
@@ -282,138 +816,66 @@ def _fit_reference_artifact(
             "GLOBAL": defaultdict(list),
         }
         for row in rows:
-            if row[score_name] is None or (
+            raw_score = row[score_name]
+            if (
+                raw_score is None
+                or not math.isfinite(float(raw_score))
+                or (
                 branch == "sequence" and int(row["sequence_length"]) < 2
+                )
             ):
                 continue
             grouped["PERSON"][str(row["role_epoch"])].append(row)
             grouped["ROLE"][str(row["role"])].append(row)
             grouped["GLOBAL"]["GLOBAL"].append(row)
-        for level, scopes in grouped.items():
+        train_end = date.fromisoformat(framework_config["splits"]["train"]["end"])
+        for level in ("ROLE", "GLOBAL"):
+            scopes = grouped[level]
             for scope_key, scope_rows in scopes.items():
-                scores = np.asarray([row[score_name] for row in scope_rows], dtype=np.float64)
-                stats = fit_reference(level, scope_key, scores)
-                days = sorted({str(row["day"]) for row in scope_rows})
-                users = sorted({str(row["user_id"]) for row in scope_rows})
-                train_end = date.fromisoformat(
-                    framework_config["splits"]["train"]["end"]
+                entry = _build_reference_entry(
+                    branch=branch,
+                    level=level,
+                    scope_key=scope_key,
+                    scope_rows=scope_rows,
+                    score_name=score_name,
+                    train_end=train_end,
                 )
-                recent_rows = [
-                    row
-                    for row in scope_rows
-                    if 0
-                    <= (train_end - date.fromisoformat(str(row["day"]))).days
-                    <= 29
-                ]
-                feature_support = np.zeros(128, dtype=np.int64)
-                for row in scope_rows:
-                    packed = np.frombuffer(row["_feature_mask"], dtype=np.uint8)
-                    feature_support += np.unpackbits(
-                        packed,
-                        bitorder="little",
-                    )[:128]
-                levels[level][scope_key] = {
-                    "stats": _reference_to_json(stats),
-                    "support": {
-                        "observations": len(scope_rows),
-                        "feature_observation_days": len(scope_rows),
-                        "observations_by_user": {
-                            user: sum(
-                                str(row["user_id"]) == user for row in scope_rows
-                            )
-                            for user in users
-                        },
-                        "users": len(users),
-                        "user_ids": users,
-                        "span_days": (
-                            (date.fromisoformat(days[-1]) - date.fromisoformat(days[0])).days + 1
-                            if days
-                            else 0
-                        ),
-                        "transitions": sum(
-                            max(int(row["sequence_length"]) - 1, 0) for row in scope_rows
-                        ),
-                        "transitions_by_user": {
-                            user: sum(
-                                max(int(row["sequence_length"]) - 1, 0)
-                                for row in scope_rows
-                                if str(row["user_id"]) == user
-                            )
-                            for user in users
-                        },
-                        "sequence_days": sum(
-                            int(row["sequence_length"]) >= 2 for row in scope_rows
-                        ),
-                        "sequence_days_by_user": {
-                            user: sum(
-                                int(row["sequence_length"]) >= 2
-                                for row in scope_rows
-                                if str(row["user_id"]) == user
-                            )
-                            for user in users
-                        },
-                        "active_days": sum(bool(row["active"]) for row in scope_rows),
-                        "mean_feature_coverage": fmean(
-                            float(row["feature_coverage"]) for row in scope_rows
-                        ),
-                        "feature_coverage_ratio_at_20": float(
-                            np.mean(feature_support >= 20)
-                        ),
-                        "feature_coverage_ratio_at_40": float(
-                            np.mean(feature_support >= 40)
-                        ),
-                        "feature_coverage_ratio_at_200": float(
-                            np.mean(feature_support >= 200)
-                        ),
-                        "minimum_nonzero_feature_support": int(
-                            feature_support[feature_support > 0].min()
-                            if np.any(feature_support > 0)
-                            else 0
-                        ),
-                        # Safe-update v5 must be able to extend a Feature
-                        # reference without reconstructing historical masks.
-                        # Persist the exact immutable per-feature support, not
-                        # only its minimum/coverage summaries.
-                        "feature_observation_counts": [
-                            int(value) for value in feature_support.tolist()
+                levels[level][scope_key] = _seal_reference_entry(entry)
+
+        target = _standalone_personal_target(framework_config)
+        for scope_key, scope_rows in grouped["PERSON"].items():
+            entry = _build_reference_entry(
+                branch=branch,
+                level="PERSON",
+                scope_key=scope_key,
+                scope_rows=scope_rows,
+                score_name=score_name,
+                train_end=train_end,
+            )
+            observation_count = int(entry["stats"]["observation_count"])
+            if observation_count < target:
+                parent = _select_personal_parent(
+                    branch=branch,
+                    person_entry=entry,
+                    levels=levels,
+                    framework_config=framework_config,
+                )
+                if parent is None:
+                    continue
+                parent_level, parent_scope_key, parent_entry = parent
+                entry["calibrator"] = {
+                    "method": "parent_shrunk_ecdf.v1",
+                    "standalone_target_observations": target,
+                    "parent": {
+                        "branch": branch,
+                        "level": parent_level,
+                        "scope_key": parent_scope_key,
+                        "entry_checksum_sha256": parent_entry[
+                            "entry_checksum_sha256"
                         ],
-                        "last_active_day": max(
-                            (
-                                str(row["day"])
-                                for row in scope_rows
-                                if bool(row["active"])
-                            ),
-                            default=None,
-                        ),
-                        "last_sequence_day": max(
-                            (
-                                str(row["day"])
-                                for row in scope_rows
-                                if int(row["sequence_length"]) >= 2
-                            ),
-                            default=None,
-                        ),
-                        "recent_30d_observations": len(recent_rows),
-                        "recent_30d_observations_by_user": {
-                            user: sum(
-                                str(row["user_id"]) == user for row in recent_rows
-                            )
-                            for user in users
-                        },
-                        "recent_30d_transitions": sum(
-                            max(int(row["sequence_length"]) - 1, 0)
-                            for row in recent_rows
-                        ),
-                        "recent_30d_transitions_by_user": {
-                            user: sum(
-                                max(int(row["sequence_length"]) - 1, 0)
-                                for row in recent_rows
-                                if str(row["user_id"]) == user
-                            )
-                            for user in users
-                        },
                     },
                 }
+            levels["PERSON"][scope_key] = _seal_reference_entry(entry)
         artifact["branches"][branch] = levels
     return artifact
 
@@ -456,7 +918,9 @@ def _ready(
         split in {"VALIDATION", "TEST"}
         and primary["readiness_mode"] == "FROZEN_AT_TRAIN_END"
     ):
-        readiness_day = date.fromisoformat(framework_config["splits"]["train"]["end"])
+        readiness_day = date.fromisoformat(
+            framework_config["splits"]["train"]["end"]
+        ) + timedelta(days=1)
     else:
         readiness_day = score_day
 
@@ -508,8 +972,10 @@ def _ready(
                 peer_users
                 >= int(role_config["min_peer_users_excluding_subject"])
                 and peer_observations >= int(role_config["min_peer_user_days"])
-                and support["feature_coverage_ratio_at_200"]
+                and support["mean_feature_coverage"]
                 >= float(role_config["min_feature_coverage_ratio"])
+                and support["minimum_nonzero_feature_support"]
+                >= int(role_config["min_support_per_feature"])
                 and recent_peer_observations
                 >= int(role_config["min_recent_30d_user_days"])
             )
@@ -535,7 +1001,7 @@ def _ready(
         return (
             support["users"] >= int(global_config["min_users"])
             and support["observations"] >= int(global_config["min_user_days"])
-            and support["feature_coverage_ratio_at_200"]
+            and support["mean_feature_coverage"]
             >= float(global_config["min_feature_coverage_ratio"])
         )
     return (
@@ -545,11 +1011,464 @@ def _ready(
     )
 
 
+_SUPPORT_FIELDS = {
+    "observations",
+    "feature_observation_days",
+    "observations_by_user",
+    "users",
+    "user_ids",
+    "span_days",
+    "transitions",
+    "transitions_by_user",
+    "sequence_days",
+    "sequence_days_by_user",
+    "active_days",
+    "mean_feature_coverage",
+    "feature_coverage_ratio_at_20",
+    "feature_coverage_ratio_at_40",
+    "feature_coverage_ratio_at_200",
+    "minimum_nonzero_feature_support",
+    "feature_observation_counts",
+    "last_active_day",
+    "last_sequence_day",
+    "recent_30d_observations",
+    "recent_30d_observations_by_user",
+    "recent_30d_transitions",
+    "recent_30d_transitions_by_user",
+}
+
+
+def _is_nonnegative_int(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 0
+
+
+def _validate_support_day(value: object, *, required: bool, field_name: str) -> None:
+    if value is None:
+        if required:
+            raise ValueError(f"reference support {field_name} is required")
+        return
+    if not required:
+        raise ValueError(f"reference support {field_name} must be null")
+    if not isinstance(value, str):
+        raise ValueError(f"reference support {field_name} must be an ISO date")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"reference support {field_name} must be an ISO date"
+        ) from exc
+    if not TRAIN_START <= parsed <= TRAIN_END:
+        raise ValueError(f"reference support {field_name} is outside locked Train")
+
+
+def _validate_reference_support(
+    support: object,
+    *,
+    observation_count: int,
+) -> list[str]:
+    if not isinstance(support, dict) or set(support) != _SUPPORT_FIELDS:
+        raise ValueError("reference entry support does not match the exact v1 contract")
+
+    integer_fields = (
+        "observations",
+        "feature_observation_days",
+        "users",
+        "span_days",
+        "transitions",
+        "sequence_days",
+        "active_days",
+        "minimum_nonzero_feature_support",
+        "recent_30d_observations",
+        "recent_30d_transitions",
+    )
+    if any(not _is_nonnegative_int(support[field]) for field in integer_fields):
+        raise ValueError("reference support counters must be non-negative integers")
+    if (
+        support["observations"] != observation_count
+        or support["feature_observation_days"] != observation_count
+        or support["span_days"] < 1
+        or support["span_days"] > (TRAIN_END - TRAIN_START).days + 1
+        or support["active_days"] > observation_count
+        or support["sequence_days"] > observation_count
+        or support["recent_30d_observations"] > observation_count
+        or support["recent_30d_transitions"] > support["transitions"]
+    ):
+        raise ValueError("reference support aggregate counters are inconsistent")
+
+    user_ids = support["user_ids"]
+    if (
+        not isinstance(user_ids, list)
+        or any(not isinstance(user, str) or not user for user in user_ids)
+        or len(set(user_ids)) != len(user_ids)
+        or support["users"] != len(user_ids)
+        or not user_ids
+    ):
+        raise ValueError("reference entry user identities are inconsistent")
+    observation_map = support["observations_by_user"]
+    per_user_contracts = (
+        ("observations_by_user", "observations", False),
+        ("transitions_by_user", "transitions", True),
+        ("sequence_days_by_user", "sequence_days", True),
+        (
+            "recent_30d_observations_by_user",
+            "recent_30d_observations",
+            True,
+        ),
+        ("recent_30d_transitions_by_user", "recent_30d_transitions", True),
+    )
+    for map_name, total_name, allow_zero in per_user_contracts:
+        per_user = support[map_name]
+        if (
+            not isinstance(per_user, dict)
+            or set(per_user) != set(user_ids)
+            or any(
+                not _is_nonnegative_int(value) or (not allow_zero and value < 1)
+                for value in per_user.values()
+            )
+            or sum(per_user.values()) != support[total_name]
+        ):
+            raise ValueError(f"reference support {map_name} is inconsistent")
+    for user in user_ids:
+        if (
+            support["sequence_days_by_user"][user] > observation_map[user]
+            or support["recent_30d_observations_by_user"][user]
+            > observation_map[user]
+            or support["recent_30d_transitions_by_user"][user]
+            > support["transitions_by_user"][user]
+        ):
+            raise ValueError("reference per-user day support is inconsistent")
+
+    coverage_fields = (
+        "mean_feature_coverage",
+        "feature_coverage_ratio_at_20",
+        "feature_coverage_ratio_at_40",
+        "feature_coverage_ratio_at_200",
+    )
+    if any(
+        isinstance(support[field], bool)
+        or not isinstance(support[field], (int, float))
+        or not math.isfinite(float(support[field]))
+        or not 0.0 <= float(support[field]) <= 1.0
+        for field in coverage_fields
+    ):
+        raise ValueError("reference feature coverage support must be finite ratios")
+    feature_counts = support["feature_observation_counts"]
+    if (
+        not isinstance(feature_counts, list)
+        or len(feature_counts) != 128
+        or any(
+            not _is_nonnegative_int(value) or value > observation_count
+            for value in feature_counts
+        )
+    ):
+        raise ValueError("reference feature support must contain 128 valid counters")
+    nonzero_counts = [value for value in feature_counts if value > 0]
+    expected_minimum = min(nonzero_counts, default=0)
+    if support["minimum_nonzero_feature_support"] != expected_minimum:
+        raise ValueError("reference minimum feature support is inconsistent")
+    expected_mean_coverage = sum(feature_counts) / (observation_count * 128)
+    if not math.isclose(
+        float(support["mean_feature_coverage"]),
+        expected_mean_coverage,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("reference support mean feature coverage is inconsistent")
+    for threshold, field_name in (
+        (20, "feature_coverage_ratio_at_20"),
+        (40, "feature_coverage_ratio_at_40"),
+        (200, "feature_coverage_ratio_at_200"),
+    ):
+        expected_ratio = sum(value >= threshold for value in feature_counts) / 128
+        if not math.isclose(
+            float(support[field_name]),
+            expected_ratio,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(f"reference {field_name} is inconsistent")
+
+    _validate_support_day(
+        support["last_active_day"],
+        required=support["active_days"] > 0,
+        field_name="last_active_day",
+    )
+    _validate_support_day(
+        support["last_sequence_day"],
+        required=support["sequence_days"] > 0,
+        field_name="last_sequence_day",
+    )
+    return user_ids
+
+
+def _validate_reference_entry_base(
+    *,
+    branch: str,
+    level: str,
+    scope_key: str,
+    entry: object,
+) -> dict[str, Any]:
+    required_entry_fields = {
+        "entry_schema_version",
+        "identity",
+        "stats",
+        "support",
+        "calibrator",
+        "entry_checksum_sha256",
+    }
+    if not isinstance(entry, dict) or set(entry) != required_entry_fields:
+        raise ValueError("reference entry does not match the exact v1 contract")
+    if entry.get("entry_schema_version") != ENTRY_CONTRACT_VERSION:
+        raise ValueError("reference entry schema version is unsupported")
+
+    identity = entry.get("identity")
+    identity_fields = {
+        "branch",
+        "level",
+        "scope_key",
+        "subject_user_id",
+        "role",
+    }
+    if not isinstance(identity, dict) or set(identity) != identity_fields:
+        raise ValueError("reference entry identity contract is invalid")
+    if (
+        identity.get("branch") != branch
+        or identity.get("level") != level
+        or identity.get("scope_key") != scope_key
+    ):
+        raise ValueError("reference entry identity does not match its artifact path")
+    subject_user_id = identity.get("subject_user_id")
+    identity_role = identity.get("role")
+    if level == "PERSON":
+        if (
+            not isinstance(subject_user_id, str)
+            or not subject_user_id
+            or not isinstance(identity_role, str)
+            or not identity_role
+        ):
+            raise ValueError("Personal reference entry identity is incomplete")
+    elif level == "ROLE":
+        if subject_user_id is not None or identity_role != scope_key or not scope_key:
+            raise ValueError("Role reference entry identity is invalid")
+    elif (
+        scope_key != "GLOBAL"
+        or subject_user_id is not None
+        or identity_role is not None
+    ):
+        raise ValueError("Global reference entry identity is invalid")
+
+    stats = entry.get("stats")
+    stats_fields = {
+        "level",
+        "scope_key",
+        "location",
+        "scale",
+        "observation_count",
+        "sorted_scores",
+    }
+    if not isinstance(stats, dict) or set(stats) != stats_fields:
+        raise ValueError("reference entry statistics contract is invalid")
+    if stats.get("level") != level or stats.get("scope_key") != scope_key:
+        raise ValueError("reference statistics do not match their artifact path")
+    location = stats.get("location")
+    scale = stats.get("scale")
+    if (
+        isinstance(location, bool)
+        or not isinstance(location, (int, float))
+        or not math.isfinite(float(location))
+        or isinstance(scale, bool)
+        or not isinstance(scale, (int, float))
+        or not math.isfinite(float(scale))
+        or float(scale) <= 0.0
+    ):
+        raise ValueError("reference statistics must have a finite location and scale")
+    observation_count = stats.get("observation_count")
+    sorted_scores = stats.get("sorted_scores")
+    if (
+        isinstance(observation_count, bool)
+        or not isinstance(observation_count, int)
+        or observation_count < 1
+        or not isinstance(sorted_scores, list)
+        or observation_count != len(sorted_scores)
+    ):
+        raise ValueError("reference observation count does not match sorted scores")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        for value in sorted_scores
+    ):
+        raise ValueError("reference sorted scores must all be finite numbers")
+    if any(
+        float(left) > float(right)
+        for left, right in zip(sorted_scores, sorted_scores[1:], strict=False)
+    ):
+        raise ValueError("reference scores are not sorted ascending")
+
+    user_ids = _validate_reference_support(
+        entry.get("support"),
+        observation_count=observation_count,
+    )
+    if level == "PERSON" and user_ids != [subject_user_id]:
+        raise ValueError("Personal reference subject does not match its support")
+
+    checksum = entry.get("entry_checksum_sha256")
+    if not _is_sha256(checksum) or checksum != _reference_entry_checksum(entry):
+        raise ValueError("reference entry checksum does not match its contents")
+    return entry
+
+
+def _validate_reference_branches(
+    artifact: dict[str, Any],
+    framework_config: dict[str, Any],
+) -> None:
+    if artifact.get("entry_contract_version") != ENTRY_CONTRACT_VERSION:
+        raise ValueError("reference artifact has no supported entry contract")
+    branches = artifact.get("branches")
+    if not isinstance(branches, dict) or set(branches) != {"feature", "sequence"}:
+        raise ValueError("reference artifact must contain exact feature/sequence branches")
+
+    validated: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+    for branch in ("feature", "sequence"):
+        levels = branches[branch]
+        if not isinstance(levels, dict) or set(levels) != {
+            "PERSON",
+            "ROLE",
+            "GLOBAL",
+        }:
+            raise ValueError("reference branch must contain exact hierarchy levels")
+        validated[branch] = {}
+        for level in ("PERSON", "ROLE", "GLOBAL"):
+            scopes = levels[level]
+            if not isinstance(scopes, dict):
+                raise ValueError("reference hierarchy level must be an object")
+            if level == "GLOBAL" and not set(scopes).issubset({"GLOBAL"}):
+                raise ValueError("Global reference entries must use the GLOBAL path")
+            validated[branch][level] = {}
+            for scope_key, raw_entry in scopes.items():
+                if not isinstance(scope_key, str) or not scope_key:
+                    raise ValueError("reference scope key must be a non-empty string")
+                validated[branch][level][scope_key] = _validate_reference_entry_base(
+                    branch=branch,
+                    level=level,
+                    scope_key=scope_key,
+                    entry=raw_entry,
+                )
+
+    target = _standalone_personal_target(framework_config)
+    for branch, levels in validated.items():
+        for level in ("ROLE", "GLOBAL"):
+            for entry in levels[level].values():
+                if entry["calibrator"] != {"method": "empirical_cdf.v1"}:
+                    raise ValueError("Role/Global references require empirical CDF")
+
+        for entry in levels["PERSON"].values():
+            count = int(entry["stats"]["observation_count"])
+            calibrator = entry["calibrator"]
+            if count >= target:
+                if calibrator != {"method": "empirical_cdf.v1"}:
+                    raise ValueError(
+                        "standalone Personal reference requires empirical CDF"
+                    )
+                continue
+            if not isinstance(calibrator, dict) or set(calibrator) != {
+                "method",
+                "standalone_target_observations",
+                "parent",
+            }:
+                raise ValueError("small Personal reference requires a pinned parent")
+            if (
+                calibrator.get("method") != "parent_shrunk_ecdf.v1"
+                or calibrator.get("standalone_target_observations") != target
+            ):
+                raise ValueError("Personal parent-shrunk calibrator contract is invalid")
+            parent = calibrator.get("parent")
+            if not isinstance(parent, dict) or set(parent) != {
+                "branch",
+                "level",
+                "scope_key",
+                "entry_checksum_sha256",
+            }:
+                raise ValueError("Personal calibration parent contract is invalid")
+            parent_level = parent.get("level")
+            parent_scope_key = parent.get("scope_key")
+            if (
+                parent.get("branch") != branch
+                or parent_level not in {"ROLE", "GLOBAL"}
+                or not isinstance(parent_scope_key, str)
+            ):
+                raise ValueError("Personal calibration parent path is invalid")
+            parent_entry = levels[parent_level].get(parent_scope_key)
+            if (
+                parent_entry is None
+                or parent.get("entry_checksum_sha256")
+                != parent_entry["entry_checksum_sha256"]
+            ):
+                raise ValueError("Personal calibration parent checksum is invalid")
+            try:
+                expected_parent = _select_personal_parent(
+                    branch=branch,
+                    person_entry=entry,
+                    levels=levels,
+                    framework_config=framework_config,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("reference parent readiness contract is invalid") from exc
+            if expected_parent is None:
+                raise ValueError("small Personal reference has no ready parent")
+            expected_level, expected_scope_key, expected_entry = expected_parent
+            if (
+                parent_level != expected_level
+                or parent_scope_key != expected_scope_key
+                or parent.get("entry_checksum_sha256")
+                != expected_entry["entry_checksum_sha256"]
+            ):
+                raise ValueError("Personal reference does not pin the expected parent")
+
+
+def _calibrated_entry_score(
+    raw_score: float,
+    entry: dict[str, Any],
+    branch_levels: dict[str, dict[str, dict[str, Any]]],
+) -> float:
+    calibrator = entry["calibrator"]
+    method = calibrator.get("method")
+    personal_q = calibrated_tail_score(raw_score, _stats(entry))
+    if method == "empirical_cdf.v1":
+        return personal_q
+    if method != "parent_shrunk_ecdf.v1":
+        raise ValueError("reference entry has an unsupported calibrator")
+    parent = calibrator["parent"]
+    parent_entry = branch_levels[parent["level"]].get(parent["scope_key"])
+    if (
+        parent_entry is None
+        or parent.get("branch") != entry["identity"]["branch"]
+        or parent.get("entry_checksum_sha256")
+        != parent_entry.get("entry_checksum_sha256")
+    ):
+        raise ValueError("parent-shrunk reference cannot resolve its pinned parent")
+    target = calibrator["standalone_target_observations"]
+    count = int(entry["stats"]["observation_count"])
+    if isinstance(target, bool) or not isinstance(target, int) or not 0 < count < target:
+        raise ValueError("parent-shrunk reference has invalid support")
+    parent_q = calibrated_tail_score(raw_score, _stats(parent_entry))
+    alpha = count / target
+    return alpha * personal_q + (1.0 - alpha) * parent_q
+
+
 def _calibrate_row(
     row: dict[str, Any],
     artifact: dict[str, Any],
     framework_config: dict[str, Any],
 ) -> dict[str, Any]:
+    split = str(row["split"]).upper()
+    score_day = date.fromisoformat(str(row["day"]))
+    train_end = date.fromisoformat(framework_config["splits"]["train"]["end"])
+    if split == "TRAIN" or score_day <= train_end:
+        raise ValueError(
+            "a frozen Train reference can only be applied to rows after Train end"
+        )
+
     calibrated: dict[str, float | None] = {"feature": None, "sequence": None}
     selected: dict[str, str] = {"feature": "NO_SCORE", "sequence": "NO_SCORE"}
     for branch, score_name in (
@@ -578,7 +1497,11 @@ def _calibrate_row(
                 framework_config=framework_config,
             ):
                 continue
-            calibrated[branch] = calibrated_tail_score(float(raw_score), _stats(entry))
+            calibrated[branch] = _calibrated_entry_score(
+                float(raw_score),
+                entry,
+                artifact["branches"][branch],
+            )
             selected[branch] = level
             break
     available = [value for value in calibrated.values() if value is not None]
@@ -623,6 +1546,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--store requires --split")
     if args.input and args.split is not None:
         raise ValueError("--split is only used with --store")
+    if args.fit_reference_out and args.max_samples is not None:
+        raise ValueError(
+            "--fit-reference-out requires the complete Train split; "
+            "--max-samples is smoke-only"
+        )
+    if args.reference_in and args.store and args.split == "TRAIN":
+        raise ValueError(
+            "a frozen Train reference cannot be applied back to the Train split"
+        )
     framework_config = _load_framework_config(args.framework_config)
     framework_config_checksum = _sha256(args.framework_config)
     device_name = (
@@ -634,8 +1566,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
     if checkpoint.get("schema_version") != "tcn-transformer-ae.v4":
         raise ValueError("checkpoint model schema is not tcn-transformer-ae.v4")
+    if args.fit_reference_out or args.reference_in:
+        _validate_checkpoint_training_contract(
+            checkpoint,
+            framework_config=framework_config,
+            framework_config_checksum=framework_config_checksum,
+        )
+    source_attestation: dict[str, Any] | None = None
     if args.input:
         windows = load_prepared_windows(args.input)
+        if args.fit_reference_out:
+            source_attestation = _validate_prepared_reference_source(
+                args.input,
+                preprocessing_checksum=str(windows.preprocessing_checksum.item()),
+                scaler_checksum=str(windows.scaler_checksum.item()),
+                sample_count=int(windows.feature_values.shape[0]),
+                feature_schema_version=str(windows.feature_schema_version.item()),
+                sequence_schema_version=str(windows.sequence_schema_version.item()),
+            )
         directory = LdapDirectory.from_raw(args.raw_root.resolve())
         raw_rows = _score_rows(
             windows=windows,
@@ -648,6 +1596,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         scaler_checksum = str(windows.scaler_checksum.item())
         input_kind = "npz"
     else:
+        if args.fit_reference_out:
+            source_attestation = _validate_store_reference_source(args.store)
         dataset = SQLiteWindowDataset(
             args.store,
             split=args.split,
@@ -673,6 +1623,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("checkpoint and input scaler checksums do not match")
     reference_artifact = None
     if args.fit_reference_out:
+        if source_attestation is None:
+            raise RuntimeError("reference source attestation was not produced")
         raw_rows = list(raw_rows)
         reference_artifact = _fit_reference_artifact(
             raw_rows,
@@ -681,12 +1633,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             scaler_checksum=scaler_checksum,
             framework_config=framework_config,
             framework_config_checksum=framework_config_checksum,
+            source_attestation=source_attestation,
+        )
+        _validate_reference_artifact_contract(
+            reference_artifact,
+            framework_config=framework_config,
+            framework_config_checksum=framework_config_checksum,
         )
         atomic_write_json(args.fit_reference_out, reference_artifact)
     if args.reference_in:
         reference_artifact = json.loads(args.reference_in.read_text(encoding="utf-8"))
         _validate_reference_artifact_contract(
             reference_artifact,
+            framework_config=framework_config,
             framework_config_checksum=framework_config_checksum,
         )
         if reference_artifact["checkpoint_sha256"] != _sha256(args.checkpoint):
@@ -700,7 +1659,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             _calibrate_row(
                 row,
                 reference_artifact,
-                reference_artifact["framework_config"],
+                framework_config,
             )
             for row in raw_rows
         )

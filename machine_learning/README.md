@@ -59,8 +59,16 @@ Set-Location .\machine_learning
 ```
 
 Lệnh này chạy liên tục `raw CSV + LDAP -> disk-backed Feature128/Sequence7 store ->
-train 1 epoch -> last-day reconstruction score -> frozen Train reference check`. Kết quả nằm trong
-`data/processed/smoke` và `data/artifacts/smoke`.
+train 1 epoch -> last-day reconstruction score raw-only`. Vì store smoke bị giới hạn, luồng này
+không phát hành frozen Train reference. Kết quả nằm trong `data/processed/smoke` và
+`data/artifacts/smoke`.
+
+Việc fit production reference yêu cầu nguồn Train đầy đủ, không row-cap cho cả
+checkpoint và scoring endpoints. Checkpoint/reference artifact đều mang source
+attestation; mỗi reference entry dùng checksum
+`hierarchical-reference-entry.v1`, còn Personal support dưới 200 được calibrate
+với ROLE/GLOBAL parent đã pin. Artifact legacy hoặc smoke sẽ fail closed và phải
+được tạo lại.
 
 Có thể chạy riêng từng bước:
 
@@ -76,6 +84,9 @@ vào event nội bộ hay artifact. Timestamp được parse như local wall-clo
 `[D-29,D]`; inference chỉ lấy reconstruction error tại ngày cuối `D`.
 
 `prepare_cert` là materializer NPZ legacy dành cho smoke/user shard và vẫn gom shard trong RAM.
+Lệnh này mặc định `--max-users 25`; manifest ghi lại giới hạn user và checkpoint tạo từ shard
+được đánh dấu không đầy đủ, nên không thể phát hành production reference. Dùng pipeline SQLite
+cho thực nghiệm production đầy đủ.
 Không dùng lệnh đó cho toàn bộ HTTP 15 GB; thực nghiệm đầy đủ dùng `build_store`/`run_experiment`
 ở phần dưới.
 

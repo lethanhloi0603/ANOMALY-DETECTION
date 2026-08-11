@@ -27,6 +27,17 @@ def validate_security_settings(app_settings: Settings) -> None:
     if environment not in {"prod", "production"}:
         return
 
+    database_scheme = app_settings.database_url.partition(":")[0].strip().lower()
+    if (
+        app_settings.safe_update_materialization_enabled
+        and database_scheme != "postgresql"
+        and not database_scheme.startswith("postgresql+")
+    ):
+        raise RuntimeError(
+            "production SAFE_UPDATE_MATERIALIZATION_ENABLED requires a "
+            "PostgreSQL DATABASE_URL"
+        )
+
     missing: list[str] = []
     if not app_settings.api_key or not app_settings.api_key.strip():
         missing.append("API_KEY")

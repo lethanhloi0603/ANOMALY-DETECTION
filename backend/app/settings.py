@@ -110,6 +110,7 @@ class Settings:
     max_request_bytes: int
     locked_alert_threshold: float | None
     auto_create_schema: bool
+    safe_update_materialization_enabled: bool
     framework_config_path: Path
     feature_catalog_path: Path
     sequence_config_path: Path
@@ -165,6 +166,10 @@ class Settings:
             auto_create_schema=_as_bool(
                 os.getenv("AUTO_CREATE_SCHEMA"),
                 True,
+            ),
+            safe_update_materialization_enabled=_as_bool(
+                os.getenv("SAFE_UPDATE_MATERIALIZATION_ENABLED"),
+                False,
             ),
             framework_config_path=Path(configured_path).expanduser().resolve(),
             feature_catalog_path=Path(feature_catalog_path).expanduser().resolve(),

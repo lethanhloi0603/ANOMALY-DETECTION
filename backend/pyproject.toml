@@ -30,6 +30,9 @@ include = ["app*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --disable-warnings"
+markers = [
+  "postgres: requires TEST_POSTGRES_URL and exercises PostgreSQL-only behavior",
+]
 
 [tool.ruff]
 target-version = "py311"

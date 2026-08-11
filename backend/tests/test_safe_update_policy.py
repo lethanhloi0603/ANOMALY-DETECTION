@@ -44,6 +44,8 @@ def test_v5_policy_contract(policy: SafeUpdatePolicy) -> None:
     assert policy.per_release_influence_cap == 0.02
     assert policy.rolling_influence_cap == 0.10
     assert policy.standalone_min_safe_scores == 200
+    assert policy.materialization_enabled is False
+    assert policy.activation_requires_zero_pending_legacy_candidates is True
 
 
 def test_v5_config_does_not_drop_any_v4_top_level_contract() -> None:
