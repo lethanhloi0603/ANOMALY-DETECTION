@@ -7,7 +7,7 @@ from typing import Any
 from app.settings import settings
 
 FEATURE_SCHEMA_VERSION = "feature128.v5"
-FRAMEWORK_SCHEMA_VERSION = "framework.v4"
+FRAMEWORK_SCHEMA_VERSION = "framework.v5"
 SEQUENCE_SCHEMA_VERSION = "sequence7.v4"
 
 

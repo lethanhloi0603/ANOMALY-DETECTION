@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import secrets
 import time
 import uuid
@@ -17,6 +18,7 @@ from app.errors import ApiError
 from app.validation import DomainValidationError
 
 logger = logging.getLogger("insider_threat.api")
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:@-]{1,160}$")
 
 
 def require_scorer_api_key(request: Request) -> None:
@@ -71,7 +73,8 @@ class RequestContextMiddleware:
             return
 
         request = Request(scope, receive=receive)
-        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+        supplied_request_id = request.headers.get("x-request-id")
+        request_id = supplied_request_id.strip() if supplied_request_id else str(uuid.uuid4())
         request.state.request_id = request_id
         request.state.actor = self.settings.api_key_actor
         response_status: int | None = None
@@ -86,6 +89,20 @@ class RequestContextMiddleware:
                 headers["x-frame-options"] = "DENY"
                 headers["referrer-policy"] = "no-referrer"
             await send(message)
+
+        if supplied_request_id is not None and not REQUEST_ID_PATTERN.fullmatch(request_id):
+            request_id = "invalid"
+            request.state.request_id = "invalid"
+            response = JSONResponse(
+                status_code=400,
+                content=error_payload(
+                    request,
+                    "INVALID_REQUEST_ID",
+                    "x-request-id must contain 1-160 safe characters",
+                ),
+            )
+            await response(scope, receive, send_with_security_headers)
+            return
 
         content_length = request.headers.get("content-length")
         max_bytes = int(getattr(self.settings, "max_request_bytes", 2_097_152))

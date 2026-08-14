@@ -11,6 +11,8 @@ import csv
 import hashlib
 import json
 import math
+import os
+import tempfile
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -21,6 +23,7 @@ from urllib.parse import urlsplit
 
 import numpy as np
 
+from insider_ml.artifacts import atomic_write_json
 from insider_ml.contracts import (
     FEATURE_DIMENSION,
     FEATURE_SCHEMA_VERSION,
@@ -934,21 +937,15 @@ def _preprocessing_checksum(
 
 
 def save_scaler(path: Path, scaler: RobustFeatureScaler) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": "robust-feature-scaler.v1",
-                "location": scaler.location.tolist(),
-                "scale": scaler.scale.tolist(),
-                "support": scaler.support.tolist(),
-                "checksum": scaler.checksum,
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
+    atomic_write_json(
+        path,
+        {
+            "schema_version": "robust-feature-scaler.v1",
+            "location": scaler.location.tolist(),
+            "scale": scaler.scale.tolist(),
+            "support": scaler.support.tolist(),
+            "checksum": scaler.checksum,
+        },
     )
 
 
@@ -1083,10 +1080,23 @@ def build_windows(
 
 def save_windows(path: Path, windows: PreparedWindows) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        path,
-        **{
-            field: getattr(windows, field)
-            for field in windows.__dataclass_fields__
-        },
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".npz",
     )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        np.savez_compressed(
+            temporary_path,
+            **{
+                field: getattr(windows, field)
+                for field in windows.__dataclass_fields__
+            },
+        )
+        with temporary_path.open("rb+") as handle:
+            os.fsync(handle.fileno())
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)

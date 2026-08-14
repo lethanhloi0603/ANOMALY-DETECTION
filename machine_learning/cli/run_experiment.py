@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from cli.score import _load_framework_config, _validate_reference_artifact_contract
+from insider_ml.artifacts import atomic_write_json
 from insider_ml.contracts import TEST_END
 from insider_ml.stream_store import (
     connect_store,
@@ -35,17 +37,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--artifact-dir",
         type=Path,
-        default=root / "data" / "artifacts" / "experiment_v1",
+        default=root / "data" / "artifacts" / "experiment_v2",
     )
     parser.add_argument(
         "--evaluation-dir",
         type=Path,
-        default=root / "data" / "evaluation" / "experiment_v1",
+        default=root / "data" / "evaluation" / "experiment_v2",
     )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--bootstrap", type=int, default=1000)
+    parser.add_argument(
+        "--framework-config",
+        type=Path,
+        default=root / "backend" / "config" / "framework.v6.json",
+    )
     parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
@@ -77,6 +84,7 @@ def _score_current(
     *,
     checkpoint: Path,
     reference: Path | None,
+    framework_config: Path,
 ) -> bool:
     manifest_path = output.with_suffix(output.suffix + ".manifest.json")
     if not output.is_file() or not manifest_path.is_file():
@@ -85,8 +93,11 @@ def _score_current(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
+    if not isinstance(manifest, dict):
+        return False
     return (
         manifest.get("checkpoint_sha256") == _sha256(checkpoint)
+        and manifest.get("framework_config_sha256") == _sha256(framework_config)
         and manifest.get("reference_sha256")
         == (_sha256(reference) if reference is not None else None)
         and manifest.get("output_sha256") == _sha256(output)
@@ -97,6 +108,34 @@ def _score_manifest(output: Path) -> dict[str, Any]:
     return json.loads(
         output.with_suffix(output.suffix + ".manifest.json").read_text(encoding="utf-8")
     )
+
+
+def _reference_current(
+    reference: Path,
+    *,
+    checkpoint: Path,
+    framework_config: Path,
+) -> bool:
+    if not reference.is_file():
+        return False
+    try:
+        artifact = json.loads(reference.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(artifact, dict):
+        return False
+    if artifact.get("checkpoint_sha256") != _sha256(checkpoint):
+        return False
+    try:
+        loaded_framework = _load_framework_config(framework_config)
+        _validate_reference_artifact_contract(
+            artifact,
+            framework_config=loaded_framework,
+            framework_config_checksum=_sha256(framework_config),
+        )
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _validate_full_store(path: Path) -> tuple[dict[str, int], dict[str, object]]:
@@ -144,6 +183,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("epochs/batch-size must be positive and bootstrap non-negative")
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
     args.evaluation_dir.mkdir(parents=True, exist_ok=True)
+    framework_config = _load_framework_config(args.framework_config)
     python = sys.executable
     common = [python, "-m"]
 
@@ -178,6 +218,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.device,
         "--endpoint-policy",
         "weekly_train",
+        "--framework-config",
+        str(args.framework_config),
     ]
     if args.resume:
         train_command.append("--resume")
@@ -192,11 +234,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             train_scores,
             checkpoint=checkpoint,
             reference=None,
+            framework_config=args.framework_config,
         )
-        and json.loads(references.read_text(encoding="utf-8")).get(
-            "checkpoint_sha256"
+        and _reference_current(
+            references,
+            checkpoint=checkpoint,
+            framework_config=args.framework_config,
         )
-        == _sha256(checkpoint)
     ):
         _run(
             [
@@ -216,6 +260,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 str(args.batch_size),
                 "--device",
                 args.device,
+                "--framework-config",
+                str(args.framework_config),
             ]
         )
 
@@ -226,6 +272,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             validation_predictions,
             checkpoint=checkpoint,
             reference=references,
+            framework_config=args.framework_config,
         )
     ):
         _run(
@@ -246,6 +293,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 str(args.batch_size),
                 "--device",
                 args.device,
+                "--framework-config",
+                str(args.framework_config),
             ]
         )
     validation_score_manifest = _score_manifest(validation_predictions)
@@ -306,6 +355,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             test_predictions,
             checkpoint=checkpoint,
             reference=references,
+            framework_config=args.framework_config,
         )
     ):
         _run(
@@ -326,6 +376,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 str(args.batch_size),
                 "--device",
                 args.device,
+                "--framework-config",
+                str(args.framework_config),
             ]
         )
     test_universe = args.evaluation_dir / "test_universe.csv"
@@ -371,34 +423,48 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ]
     )
     test_report = json.loads(test_metrics.read_text(encoding="utf-8"))
+    reference_report = json.loads(references.read_text(encoding="utf-8"))
+    test_score_manifest = _score_manifest(test_predictions)
     report = {
-        "schema_version": "cert-experiment-run.v1",
+        "schema_version": (
+            "cert-experiment-run.v2"
+            if framework_config["schema_version"] == "framework.v6"
+            else "cert-experiment-run.v1"
+        ),
         "status": "COMPLETE",
         "store": str(args.store.resolve()),
         "checkpoint": str(checkpoint.resolve()),
+        "framework_config_sha256": _sha256(args.framework_config),
+        "framework_schema_version": framework_config["schema_version"],
         "references": str(references.resolve()),
         "validation_metrics": str(validation_metrics.resolve()),
         "test_metrics": str(test_metrics.resolve()),
         "locked_validation_threshold": locked_threshold,
         "store_split_counts": store_split_counts,
         "readiness_preflight": readiness_preflight,
+        "reference_build_diagnostics": reference_report.get("build_diagnostics"),
         "training_endpoint_policy": "WEEKLY_TRAIN",
         "validation": {
             "ranking": validation_report["ranking"],
             "coverage": validation_report["coverage"],
+            "fallback_rates": validation_report["fallback_rates"],
+            "incidents": validation_report["incidents"],
+            "readiness_outcomes": validation_score_manifest.get(
+                "readiness_outcomes"
+            ),
         },
         "test": {
             "ranking": test_report["ranking"],
             "coverage": test_report["coverage"],
+            "fallback_rates": test_report["fallback_rates"],
+            "incidents": test_report["incidents"],
             "at_threshold": test_report["at_threshold"],
             "operations": test_report["operations"],
+            "readiness_outcomes": test_score_manifest.get("readiness_outcomes"),
         },
     }
     report_path = args.artifact_dir / "experiment_report.json"
-    report_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(report_path, report)
     report["report"] = str(report_path.resolve())
     return report
 

@@ -50,16 +50,42 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            compare_type=True,
-            compare_server_default=True,
-            render_as_batch=connection.dialect.name == "sqlite",
-        )
+        is_sqlite = connection.dialect.name == "sqlite"
+        if is_sqlite:
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            if connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() != 0:
+                raise RuntimeError("could not disable SQLite foreign keys for batch migration")
+        try:
+            context.configure(
+                connection=connection,
+                target_metadata=target_metadata,
+                compare_type=True,
+                compare_server_default=True,
+                render_as_batch=is_sqlite,
+            )
 
-        with context.begin_transaction():
-            context.run_migrations()
+            with context.begin_transaction():
+                context.run_migrations()
+
+            if is_sqlite:
+                violations = connection.exec_driver_sql(
+                    "PRAGMA foreign_key_check"
+                ).fetchall()
+                if violations:
+                    first = violations[0]
+                    connection.rollback()
+                    raise RuntimeError(
+                        "SQLite foreign-key check failed after migration: "
+                        f"table={first[0]!r}, rowid={first[1]!r}, parent={first[2]!r}"
+                    )
+                connection.commit()
+        finally:
+            if is_sqlite:
+                if connection.in_transaction():
+                    connection.rollback()
+                connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+                if connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() != 1:
+                    raise RuntimeError("could not restore SQLite foreign keys after migration")
 
 
 if context.is_offline_mode():

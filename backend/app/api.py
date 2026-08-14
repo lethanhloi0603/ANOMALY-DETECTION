@@ -53,6 +53,8 @@ from app.schemas import (
     RoleRead,
     SafeUpdateProcessRequest,
     SafeUpdateProcessResult,
+    ScoringWatermarkCloseRequest,
+    ScoringWatermarkRead,
     SequenceRead,
     SequenceUpsert,
     SourceType,
@@ -61,6 +63,7 @@ from app.schemas import (
 )
 from app.services import (
     assign_role,
+    close_scoring_day,
     create_artifact,
     create_assessment,
     create_ingestion_job,
@@ -292,6 +295,21 @@ def _reference_response(profile: ReferenceProfile) -> dict[str, Any]:
         "frozen": profile.is_frozen,
         "support_json": support,
         "statistics_json": profile.statistics_json,
+        "parent_reference_profile_id": (
+            str(profile.parent_reference_profile_id)
+            if profile.parent_reference_profile_id
+            else None
+        ),
+        "calibration_parent_profile_id": (
+            str(profile.calibration_parent_profile_id)
+            if profile.calibration_parent_profile_id
+            else None
+        ),
+        "reference_version": profile.reference_version,
+        "release_kind": profile.release_kind.value.upper() if profile.release_kind else None,
+        "release_day": profile.release_day,
+        "release_influence_ratio": profile.release_influence_ratio,
+        "policy_version": profile.policy_version,
         "checksum": profile.checksum,
         "created_at": profile.created_at,
     }
@@ -378,13 +396,41 @@ def _safe_update_response(
         "branch": candidate.branch.value.upper(),
         "status": candidate.status.value.upper(),
         "quarantine_until": candidate.quarantine_until,
+        "eligible_on": candidate.eligible_on,
+        "admission_percentile": candidate.admission_percentile,
+        "admission_threshold": candidate.admission_threshold,
+        "policy_version": candidate.policy_version,
+        "materialized_reference_profile_id": (
+            str(candidate.materialized_reference_profile_id)
+            if candidate.materialized_reference_profile_id
+            else None
+        ),
+        "reference_release_id": (
+            str(candidate.reference_release_id)
+            if candidate.reference_release_id
+            else None
+        ),
         "decision_reasons_json": candidate.reason_codes,
         "decided_at": (
-            candidate.updated_at
+            candidate.decision_at or candidate.updated_at
             if candidate.status.value in {"accepted", "rejected", "applied"}
             else None
         ),
         "created_at": candidate.created_at,
+    }
+
+
+def _scoring_watermark_response(watermark: Any) -> dict[str, Any]:
+    return {
+        "id": str(watermark.id),
+        "day": watermark.day,
+        "model_version": watermark.model_version,
+        "config_version": watermark.config_version,
+        "expected_assessments": watermark.expected_assessments,
+        "persisted_assessments": watermark.persisted_assessments,
+        "universe_checksum": watermark.universe_checksum,
+        "assessment_set_checksum": watermark.assessment_set_checksum,
+        "completed_at": watermark.completed_at,
     }
 
 
@@ -624,6 +670,14 @@ def read_checkpoints(job_id: str, db: DbSession) -> list[dict[str, Any]]:
     tags=["events"],
 )
 def post_events(payload: EventBatchCreate, request: Request, db: DbSession) -> dict[str, Any]:
+    configured_limit = min(int(request.app.state.settings.max_batch_events), 1000)
+    if len(payload.events) > configured_limit:
+        raise ApiError(
+            413,
+            "EVENT_BATCH_TOO_LARGE",
+            f"event batch exceeds configured limit of {configured_limit}",
+            {"configured_limit": configured_limit, "received": len(payload.events)},
+        )
     organization = _organization(db)
     actor, request_id = _request_context(request)
     inserted, duplicates, event_uids = ingest_events(
@@ -941,22 +995,54 @@ def update_alert(
     "/safe-updates/process",
     response_model=SafeUpdateProcessResult,
     tags=["safe-update"],
+    dependencies=[Depends(require_scorer_api_key)],
 )
 def post_safe_update_process(
     payload: SafeUpdateProcessRequest, request: Request, db: DbSession
 ) -> dict[str, int]:
     organization = _organization(db)
     actor, request_id = _request_context(request)
-    accepted, rejected, pending = process_safe_updates(
+    result = process_safe_updates(
         db,
         organization,
-        through_date=payload.through_date,
+        model_version=payload.model_version,
+        config_version=payload.config_version,
+        runtime_materialization_enabled=(
+            request.app.state.settings.safe_update_materialization_enabled
+        ),
         limit=payload.limit,
         actor=actor,
         request_id=request_id,
     )
     _commit(db)
-    return {"accepted": accepted, "rejected": rejected, "pending": pending}
+    return result
+
+
+@api.post(
+    "/scoring-watermarks/close-day",
+    response_model=ScoringWatermarkRead,
+    status_code=status.HTTP_201_CREATED,
+    tags=["safe-update"],
+    dependencies=[Depends(require_scorer_api_key)],
+)
+def post_close_scoring_day(
+    payload: ScoringWatermarkCloseRequest,
+    request: Request,
+    db: DbSession,
+) -> Any:
+    organization = _organization(db)
+    actor, request_id = _request_context(request)
+    watermark = close_scoring_day(
+        db,
+        organization,
+        day=payload.day,
+        model_version=payload.model_version,
+        config_version=payload.config_version,
+        actor=actor,
+        request_id=request_id,
+    )
+    _commit(db)
+    return _scoring_watermark_response(watermark)
 
 
 router.include_router(api)

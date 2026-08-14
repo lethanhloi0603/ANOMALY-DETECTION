@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import uuid
-from bisect import bisect_right
 from collections import Counter, defaultdict
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, date, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import Session
 
 from app.catalog import (
@@ -29,6 +31,21 @@ from app.domain.readiness import (
     SequenceRoleSupport,
     select_feature_reference,
     select_sequence_reference,
+)
+from app.domain.safe_update import (
+    FeatureBootstrapSupport,
+    ReleaseWindowEntry,
+    SafeUpdatePolicy,
+    SequenceBootstrapSupport,
+    admission_allowed,
+    bounded_release_capacity,
+    build_personal_calibrator,
+    empirical_percentile,
+    feature_bootstrap_readiness,
+    quarantine_window,
+    reference_percentile,
+    robust_score_statistics,
+    sequence_bootstrap_readiness,
 )
 from app.errors import ApiError, conflict, not_found
 from app.models import (
@@ -53,13 +70,18 @@ from app.models import (
     LegacyTimeContext,
     Organization,
     PCContext,
+    PersonalAccumulatorStatus,
+    PersonalReferenceAccumulator,
     ReferenceLevel,
     ReferenceProfile,
+    ReferenceRelease,
+    ReferenceReleaseKind,
     RiskAssessment,
     Role,
     RoleAssignment,
     SafeUpdateCandidate,
     ScoreStatus,
+    ScoringWatermark,
     UpdateStatus,
     User,
     UserDayFeature,
@@ -101,6 +123,47 @@ DEFAULT_ORGANIZATION_SLUG = "default"
 
 def _enum_value(value: Any) -> Any:
     return value.value if hasattr(value, "value") else value
+
+
+def _lock_assessment_release(
+    session: Session,
+    *,
+    organization_id: uuid.UUID,
+    user_id: uuid.UUID,
+    day: date,
+    model_version: str,
+    config_version: str,
+) -> None:
+    """Serialize one assessment release on PostgreSQL.
+
+    SQLite remains the development/test database and serializes writers at the
+    database level. PostgreSQL needs an explicit transaction-scoped lock so two
+    scorer workers cannot both create branch scores before the unique release
+    constraint is observed.
+    """
+
+    bind = session.get_bind()
+    if bind.dialect.name != "postgresql":
+        return
+    payload = "|".join(
+        (
+            str(organization_id),
+            str(user_id),
+            day.isoformat(),
+            model_version,
+            config_version,
+        )
+    )
+    raw_key = int.from_bytes(
+        hashlib.sha256(payload.encode("utf-8")).digest()[:8],
+        "big",
+        signed=False,
+    )
+    signed_key = raw_key if raw_key < 2**63 else raw_key - 2**64
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(:key)"),
+        {"key": signed_key},
+    )
 
 
 def ensure_default_organization(session: Session) -> Organization:
@@ -323,6 +386,24 @@ def assign_role(
     request_id: str,
 ) -> RoleAssignment:
     role = get_role(session, organization, payload.role_code)
+    closed_day_statement = select(ScoringWatermark.day).where(
+        ScoringWatermark.organization_id == organization.id,
+        ScoringWatermark.day >= payload.valid_from,
+    )
+    if payload.valid_to is not None:
+        closed_day_statement = closed_day_statement.where(
+            ScoringWatermark.day < payload.valid_to
+        )
+    closed_day = session.scalar(closed_day_statement.order_by(ScoringWatermark.day).limit(1))
+    if closed_day is not None:
+        raise conflict(
+            "ROLE_TIMELINE_DAY_ALREADY_CLOSED",
+            "the role interval overlaps an immutable scoring-universe watermark",
+            {
+                "user_id": user.external_user_id,
+                "closed_day": closed_day.isoformat(),
+            },
+        )
     assignment = RoleAssignment(
         user_id=user.id,
         role_id=role.id,
@@ -1437,6 +1518,52 @@ def create_reference_profile(
     calibrator["sorted_scores"] = normalized_scores
 
     support = dict(payload.support)
+    if (
+        payload.config_version == "framework.v5"
+        and level is ReferenceLevel.PERSON
+        and payload.branch.value == "FEATURE"
+    ):
+        observation_counts = support.get("feature_observation_counts")
+        if (
+            not isinstance(observation_counts, list)
+            or len(observation_counts) != 128
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in observation_counts
+            )
+        ):
+            raise DomainValidationError(
+                "PERSON_FEATURE_OBSERVATION_COUNTS_REQUIRED",
+                "framework.v5 Personal Feature references require 128 "
+                "non-negative observation counts",
+            )
+        support["feature_observation_counts"] = [
+            int(value) for value in observation_counts
+        ]
+        observation_days = int(
+            support.get("feature_observation_days")
+            or support.get("observations")
+            or support.get("support_days")
+            or support.get("active_days")
+            or 0
+        )
+        if observation_days < 1 or any(
+            value > observation_days for value in observation_counts
+        ):
+            raise DomainValidationError(
+                "PERSON_FEATURE_OBSERVATION_DAYS_INVALID",
+                "feature observation counts must not exceed their positive "
+                "observation-day denominator",
+            )
+        support["feature_observation_days"] = observation_days
+        support["feature_dimension"] = 128
+        support["coverage"] = sum(observation_counts) / (observation_days * 128)
+        used_counts = [value for value in observation_counts if value > 0]
+        support["min_feature_observations"] = (
+            min(used_counts) if used_counts else 0
+        )
     support["_as_of_date"] = payload.as_of_date.isoformat()
     support["_reference_version"] = payload.version
     profile = ReferenceProfile(
@@ -1473,6 +1600,12 @@ def create_reference_profile(
         support_json=support,
         statistics_json=payload.statistics,
         calibrator_json=calibrator,
+        release_kind=(
+            ReferenceReleaseKind.LEGACY
+            if payload.config_version == "framework.v4"
+            else None
+        ),
+        policy_version=payload.config_version,
         is_frozen=payload.frozen,
         checksum=payload.checksum,
     )
@@ -1516,6 +1649,26 @@ def _stored_scope(
     }
 
 
+def _stored_staleness_gap(
+    support: dict[str, Any],
+    *,
+    gap_keys: Sequence[str],
+    day_keys: Sequence[str],
+) -> int:
+    explicit = _field(support, *gap_keys)
+    if explicit is not None:
+        return int(explicit)
+    last_day_raw = _field(support, *day_keys)
+    if last_day_raw is None:
+        raise KeyError(day_keys[0])
+    last_day = (
+        last_day_raw
+        if isinstance(last_day_raw, date)
+        else date.fromisoformat(str(last_day_raw))
+    )
+    return max((support["support_as_of"] - last_day).days, 0)
+
+
 def _build_feature_supports(
     profiles: dict[ReferenceLevel, ReferenceProfile],
     role_known: bool,
@@ -1538,18 +1691,31 @@ def _build_feature_supports(
                         person,
                         "active_days_current_role",
                         "active_days_in_current_role",
+                        default=_field(person, "active_days", "active_days_before_d"),
                     )
                 ),
-                coverage=float(_field(person, "coverage", "feature_coverage")),
+                coverage=float(
+                    _field(
+                        person,
+                        "coverage",
+                        "feature_coverage",
+                        "mean_feature_coverage",
+                    )
+                ),
                 min_feature_observations=int(
                     _field(
                         person,
                         "min_feature_observations",
                         "min_observations_per_used_feature",
                         "support_per_feature",
+                        "minimum_nonzero_feature_support",
                     )
                 ),
-                last_active_gap_days=int(_field(person, "last_active_gap_days", "last_active_gap")),
+                last_active_gap_days=_stored_staleness_gap(
+                    person,
+                    gap_keys=("last_active_gap_days", "last_active_gap"),
+                    day_keys=("last_active_day",),
+                ),
             )
             if person
             else None,
@@ -1614,15 +1780,17 @@ def _build_sequence_supports(
                         person,
                         "sequence_days_current_role",
                         "sequence_days_in_current_role",
+                        default=person.get("sequence_days"),
                     )
                 ),
-                last_active_gap_days=int(
-                    _field(
-                        person,
+                last_active_gap_days=_stored_staleness_gap(
+                    person,
+                    gap_keys=(
                         "last_active_gap_days",
                         "stale_gap_days",
                         "stale_gap",
-                    )
+                    ),
+                    day_keys=("last_sequence_day", "last_active_day"),
                 ),
             )
             if person
@@ -1659,6 +1827,36 @@ def _build_sequence_supports(
         ) from exc
 
 
+def _catalog_version_for_branch(branch: Branch) -> str:
+    return FEATURE_SCHEMA_VERSION if branch is Branch.FEATURE else SEQUENCE_SCHEMA_VERSION
+
+
+def _personal_accumulator_for_scope(
+    session: Session,
+    organization: Organization,
+    user: User,
+    epoch_assignment: RoleAssignment,
+    *,
+    branch: Branch,
+    model_version: str,
+    config_version: str,
+    lock: bool = False,
+) -> PersonalReferenceAccumulator | None:
+    statement = select(PersonalReferenceAccumulator).where(
+        PersonalReferenceAccumulator.organization_id == organization.id,
+        PersonalReferenceAccumulator.user_id == user.id,
+        PersonalReferenceAccumulator.role_assignment_id == epoch_assignment.id,
+        PersonalReferenceAccumulator.branch == branch,
+        PersonalReferenceAccumulator.model_version == model_version,
+        PersonalReferenceAccumulator.config_version == config_version,
+        PersonalReferenceAccumulator.catalog_version
+        == _catalog_version_for_branch(branch),
+    )
+    if lock:
+        statement = statement.with_for_update()
+    return session.scalar(statement)
+
+
 def _profile_for_decision(
     session: Session,
     organization: Organization,
@@ -1674,6 +1872,17 @@ def _profile_for_decision(
     explicit_ids: dict[str, str],
     required: bool = True,
 ) -> ReferenceProfile | None:
+    accumulator: PersonalReferenceAccumulator | None = None
+    if level is ReferenceLevel.PERSON and assignment is not None:
+        accumulator = _personal_accumulator_for_scope(
+            session,
+            organization,
+            user,
+            role_epoch_anchor(session, assignment),
+            branch=branch,
+            model_version=model_version,
+            config_version=config_version,
+        )
     explicit = explicit_ids.get(level.value.upper()) or explicit_ids.get(level.value)
     if explicit:
         try:
@@ -1685,14 +1894,34 @@ def _profile_for_decision(
         if profile is None:
             raise not_found("reference profile", explicit)
         candidates = [profile]
+    elif (
+        level is ReferenceLevel.PERSON
+        and data_split == "PRODUCTION"
+        and accumulator is not None
+    ):
+        profile = (
+            session.get(ReferenceProfile, accumulator.active_reference_profile_id)
+            if accumulator.active_reference_profile_id is not None
+            else None
+        )
+        candidates = [profile] if profile is not None else []
     else:
+        selection_cutoff = fitted_through
+        if data_split in {"VALIDATION", "TEST"}:
+            selection_cutoff = min(
+                fitted_through,
+                date.fromisoformat(
+                    str(load_framework_config()["splits"]["train"]["end"])
+                ),
+            )
         statement = select(ReferenceProfile).where(
             ReferenceProfile.organization_id == organization.id,
             ReferenceProfile.branch == branch,
             ReferenceProfile.level == level,
             ReferenceProfile.model_version == model_version,
             ReferenceProfile.config_version == config_version,
-            ReferenceProfile.fitted_through <= fitted_through,
+            ReferenceProfile.catalog_version == _catalog_version_for_branch(branch),
+            ReferenceProfile.fitted_through <= selection_cutoff,
         )
         if level is ReferenceLevel.PERSON:
             if assignment is None:
@@ -1733,11 +1962,30 @@ def _profile_for_decision(
         )
     profile = candidates[0]
     if (
+        level is ReferenceLevel.PERSON
+        and data_split == "PRODUCTION"
+        and accumulator is not None
+        and profile.id != accumulator.active_reference_profile_id
+    ):
+        raise DomainValidationError(
+            "PERSON_REFERENCE_NOT_ACTIVE",
+            "production scoring must use the accumulator's active immutable Personal reference",
+            {
+                "provided": str(profile.id),
+                "active": (
+                    str(accumulator.active_reference_profile_id)
+                    if accumulator.active_reference_profile_id
+                    else None
+                ),
+            },
+        )
+    if (
         profile.organization_id != organization.id
         or profile.branch is not branch
         or profile.level is not level
         or profile.model_version != model_version
         or profile.config_version != config_version
+        or profile.catalog_version != _catalog_version_for_branch(branch)
         or profile.fitted_through > fitted_through
     ):
         raise DomainValidationError(
@@ -1780,7 +2028,10 @@ def _profile_for_decision(
                 "REFERENCE_NOT_FROZEN",
                 "all PERSON, ROLE, and GLOBAL evaluation references must be frozen",
             )
-        if profile.fitted_through > date(2010, 5, 31):
+        train_end = date.fromisoformat(
+            str(load_framework_config()["splits"]["train"]["end"])
+        )
+        if profile.fitted_through > train_end:
             raise DomainValidationError(
                 "REFERENCE_NOT_TRAIN_ONLY",
                 "all evaluation references must be fitted on Train only",
@@ -1849,6 +2100,47 @@ def _decision_snapshot(
     }
 
 
+def _profile_percentile(
+    session: Session,
+    profile: ReferenceProfile,
+    raw_score: float,
+) -> float:
+    parent_scores: Sequence[float] | None = None
+    if profile.calibrator_json.get("method") == "parent_shrunk_ecdf.v1":
+        parent_id = profile.calibration_parent_profile_id
+        parent = session.get(ReferenceProfile, parent_id) if parent_id else None
+        expected_id = str(
+            profile.calibrator_json.get("parent_reference_profile_id", "")
+        )
+        expected_checksum = str(
+            profile.calibrator_json.get("parent_reference_checksum", "")
+        )
+        if (
+            parent is None
+            or str(parent.id) != expected_id
+            or parent.checksum != expected_checksum
+            or parent.level not in {ReferenceLevel.ROLE, ReferenceLevel.GLOBAL}
+        ):
+            raise DomainValidationError(
+                "REFERENCE_CALIBRATION_PARENT_INVALID",
+                "Personal calibration parent is missing or does not match its immutable checksum",
+                {"reference_profile_id": str(profile.id)},
+            )
+        parent_scores = parent.calibrator_json.get("sorted_scores")
+    try:
+        return reference_percentile(
+            raw_score,
+            profile.calibrator_json,
+            parent_sorted_scores=parent_scores,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DomainValidationError(
+            "REFERENCE_CALIBRATOR_INVALID",
+            "selected reference does not contain a supported empirical CDF calibrator",
+            {"reference_profile_id": str(profile.id), "error": str(exc)},
+        ) from exc
+
+
 def _persist_branch_score(
     session: Session,
     organization: Organization,
@@ -1877,20 +2169,7 @@ def _persist_branch_score(
                 "selected readiness level has no stored reference profile",
                 {"branch": branch.value, "level": level.value},
             )
-        calibrator_scores = profile.calibrator_json.get("sorted_scores")
-        if (
-            profile.calibrator_json.get("method") != "empirical_cdf.v1"
-            or not isinstance(calibrator_scores, list)
-            or not calibrator_scores
-        ):
-            raise DomainValidationError(
-                "REFERENCE_CALIBRATOR_INVALID",
-                "selected reference does not contain an empirical CDF calibrator",
-                {"reference_profile_id": str(profile.id)},
-            )
-        q_score = bisect_right(calibrator_scores, float(payload.raw_score)) / len(
-            calibrator_scores
-        )
+        q_score = _profile_percentile(session, profile, float(payload.raw_score))
         score = BranchScore(
             organization_id=organization.id,
             user_id=user.id,
@@ -1929,48 +2208,430 @@ def _persist_branch_score(
     return score
 
 
-def _personal_profile_for_candidate(
+def _lock_personal_accumulator_scope(
     session: Session,
     organization: Organization,
     user: User,
+    epoch_assignment: RoleAssignment,
+    *,
+    branch: Branch,
+    model_version: str,
+    config_version: str,
+) -> None:
+    if session.get_bind().dialect.name != "postgresql":
+        return
+    lock_payload = "|".join(
+        (
+            str(organization.id),
+            str(user.id),
+            str(epoch_assignment.id),
+            branch.value,
+            model_version,
+            config_version,
+            _catalog_version_for_branch(branch),
+        )
+    )
+    raw_key = int.from_bytes(
+        hashlib.sha256(lock_payload.encode("utf-8")).digest()[:8],
+        "big",
+        signed=False,
+    )
+    signed_key = raw_key if raw_key < 2**63 else raw_key - 2**64
+    session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": signed_key})
+
+
+def _admission_parent_for_branch(
+    *,
+    branch: Branch,
+    score_date: date,
+    branch_input: BranchAssessmentInput,
+    profiles: dict[ReferenceLevel, ReferenceProfile],
+    role_known: bool,
+    framework_config: Mapping[str, Any],
+) -> tuple[ReferenceProfile | None, list[str]]:
+    parent_profiles = {
+        level: profile
+        for level, profile in profiles.items()
+        if level in {ReferenceLevel.ROLE, ReferenceLevel.GLOBAL}
+    }
+    if branch is Branch.FEATURE:
+        _, role, global_support = _build_feature_supports(parent_profiles, role_known)
+        decision = select_feature_reference(
+            score_date=score_date,
+            person=None,
+            role=role,
+            global_support=global_support,
+            config=framework_config,
+        )
+    else:
+        _, role, global_support = _build_sequence_supports(parent_profiles, role_known)
+        decision = select_sequence_reference(
+            score_date=score_date,
+            seq_len=int(branch_input.seq_len or 0),
+            person=None,
+            role=role,
+            global_support=global_support,
+            config=framework_config,
+        )
+    if not decision.can_score:
+        return None, ["ADMISSION_PARENT_NOT_READY", *decision.reason_codes]
+    selected = ReferenceLevel(decision.selected_level.value.lower())
+    if selected not in {ReferenceLevel.ROLE, ReferenceLevel.GLOBAL}:
+        return None, ["ADMISSION_PARENT_MUST_BE_NON_PERSON"]
+    parent = profiles.get(selected)
+    if parent is None:
+        return None, ["ADMISSION_PARENT_PROFILE_MISSING"]
+    if not parent.is_frozen:
+        return None, ["ADMISSION_PARENT_NOT_FROZEN"]
+    if parent.calibrator_json.get("method") != "empirical_cdf.v1":
+        return None, ["ADMISSION_PARENT_CALIBRATOR_INVALID"]
+    return parent, []
+
+
+def _candidate_source_observation(
+    session: Session,
+    organization: Organization,
+    user: User,
+    *,
+    branch: Branch,
+    candidate_day: date,
+) -> tuple[UserDayFeature | UserDaySequence | None, dict[str, Any]]:
+    if branch is Branch.FEATURE:
+        feature = session.scalar(
+            select(UserDayFeature)
+            .join(FeatureCatalog, FeatureCatalog.id == UserDayFeature.catalog_id)
+            .where(
+                UserDayFeature.organization_id == organization.id,
+                UserDayFeature.user_id == user.id,
+                UserDayFeature.day == candidate_day,
+                FeatureCatalog.version == FEATURE_SCHEMA_VERSION,
+            )
+        )
+        if feature is None or not feature.is_active_day:
+            return None, {}
+        present_ordinals = [
+            index + 1
+            for index, present in enumerate(feature.present_mask)
+            if bool(present)
+        ]
+        return feature, {
+            "active_day": True,
+            "feature_dimension": len(feature.present_mask),
+            "present_ordinals": present_ordinals,
+        }
+    sequence = session.scalar(
+        select(UserDaySequence).where(
+            UserDaySequence.organization_id == organization.id,
+            UserDaySequence.user_id == user.id,
+            UserDaySequence.day == candidate_day,
+            UserDaySequence.vocabulary_version == SEQUENCE_SCHEMA_VERSION,
+        )
+    )
+    if sequence is None or sequence.seq_len < 2:
+        return None, {}
+    return sequence, {
+        "sequence_day": True,
+        "transitions": sequence.seq_len - 1,
+    }
+
+
+def _get_or_create_personal_accumulator(
+    session: Session,
+    organization: Organization,
+    user: User,
+    epoch_assignment: RoleAssignment,
+    *,
+    branch: Branch,
+    assessment: RiskAssessment,
+    admission_parent: ReferenceProfile,
+    active_personal_profile: ReferenceProfile | None,
+) -> PersonalReferenceAccumulator:
+    _lock_personal_accumulator_scope(
+        session,
+        organization,
+        user,
+        epoch_assignment,
+        branch=branch,
+        model_version=assessment.model_version,
+        config_version=assessment.config_version,
+    )
+    accumulator = _personal_accumulator_for_scope(
+        session,
+        organization,
+        user,
+        epoch_assignment,
+        branch=branch,
+        model_version=assessment.model_version,
+        config_version=assessment.config_version,
+        lock=True,
+    )
+    if accumulator is not None:
+        return accumulator
+    accumulator = PersonalReferenceAccumulator(
+        organization_id=organization.id,
+        user_id=user.id,
+        role_assignment_id=epoch_assignment.id,
+        branch=branch,
+        model_version=assessment.model_version,
+        config_version=assessment.config_version,
+        catalog_version=_catalog_version_for_branch(branch),
+        admission_reference_profile_id=admission_parent.id,
+        active_reference_profile_id=(
+            active_personal_profile.id if active_personal_profile is not None else None
+        ),
+        status=(
+            PersonalAccumulatorStatus.ACTIVE
+            if active_personal_profile is not None
+            else PersonalAccumulatorStatus.WARMING
+        ),
+        release_sequence=(
+            active_personal_profile.reference_version or 1
+            if active_personal_profile is not None
+            else 0
+        ),
+        last_release_day=(
+            active_personal_profile.release_day
+            if active_personal_profile is not None
+            else None
+        ),
+    )
+    session.add(accumulator)
+    session.flush()
+    return accumulator
+
+
+def _record_safe_update_admission(
+    session: Session,
+    organization: Organization,
+    user: User,
+    epoch_assignment: RoleAssignment,
+    *,
+    assessment: RiskAssessment,
+    branch_score: BranchScore,
+    branch_input: BranchAssessmentInput,
+    profiles: dict[ReferenceLevel, ReferenceProfile],
+    role_known: bool,
+    framework_config: Mapping[str, Any],
+    policy: SafeUpdatePolicy,
+    actor: str,
+    request_id: str,
+) -> SafeUpdateCandidate | None:
+    reasons: list[str] = []
+    if assessment.split is not DataSplit.PRODUCTION:
+        reasons.append("PRIMARY_EXPERIMENT_UPDATE_FORBIDDEN")
+    if assessment.status is not AssessmentStatus.SCORED:
+        reasons.append("SOURCE_ASSESSMENT_NOT_SCORED")
+    if assessment.is_alert:
+        reasons.append("DAY_IS_ALERT")
+    if branch_score.status is not ScoreStatus.SCORED or branch_score.raw_score is None:
+        reasons.append("SOURCE_BRANCH_NOT_SCORED")
+
+    existing_accumulator = _personal_accumulator_for_scope(
+        session,
+        organization,
+        user,
+        epoch_assignment,
+        branch=branch_score.branch,
+        model_version=assessment.model_version,
+        config_version=assessment.config_version,
+    )
+    if existing_accumulator is not None:
+        parent = session.get(
+            ReferenceProfile,
+            existing_accumulator.admission_reference_profile_id,
+        )
+        if (
+            parent is None
+            or parent.organization_id != organization.id
+            or parent.branch is not branch_score.branch
+            or parent.level not in {ReferenceLevel.ROLE, ReferenceLevel.GLOBAL}
+            or not parent.is_frozen
+        ):
+            reasons.append("PINNED_ADMISSION_PARENT_INVALID")
+            parent = None
+    else:
+        parent, parent_reasons = _admission_parent_for_branch(
+            branch=branch_score.branch,
+            score_date=assessment.day,
+            branch_input=branch_input,
+            profiles=profiles,
+            role_known=role_known,
+            framework_config=framework_config,
+        )
+        reasons.extend(parent_reasons)
+    observation, contribution = _candidate_source_observation(
+        session,
+        organization,
+        user,
+        branch=branch_score.branch,
+        candidate_day=assessment.day,
+    )
+    if observation is None:
+        reasons.append("SOURCE_USER_DAY_MISSING_OR_INACTIVE")
+    elif isinstance(observation, UserDaySequence):
+        if branch_input.seq_len != observation.seq_len:
+            reasons.append("SOURCE_SEQUENCE_LENGTH_MISMATCH")
+        if (
+            branch_input.truncated is not None
+            and branch_input.truncated != observation.truncated
+        ):
+            reasons.append("SOURCE_SEQUENCE_TRUNCATION_MISMATCH")
+
+    percentile: float | None = None
+    if parent is not None and branch_score.raw_score is not None:
+        try:
+            percentile = empirical_percentile(
+                float(branch_score.raw_score),
+                parent.calibrator_json["sorted_scores"],
+            )
+        except (KeyError, TypeError, ValueError):
+            reasons.append("ADMISSION_PARENT_CALIBRATOR_INVALID")
+        else:
+            if not admission_allowed(
+                percentile,
+                policy.admission_max_percentile_exclusive,
+            ):
+                reasons.append("PARENT_PERCENTILE_NOT_BELOW_THRESHOLD")
+
+    if reasons:
+        append_audit(
+            session,
+            organization,
+            actor=actor,
+            action="safe_update.admission_rejected",
+            entity_type="branch_score",
+            entity_id=str(branch_score.id),
+            request_id=request_id,
+            after={
+                "branch": branch_score.branch.value,
+                "day": assessment.day,
+                "user_id": user.external_user_id,
+                "parent_reference_profile_id": str(parent.id) if parent else None,
+                "parent_percentile": percentile,
+                "threshold_exclusive": policy.admission_max_percentile_exclusive,
+                "reason_codes": sorted(set(reasons)),
+                "policy_version": policy.policy_version,
+            },
+        )
+        return None
+
+    assert parent is not None
+    assert observation is not None
+    assert percentile is not None
+    active_personal = profiles.get(ReferenceLevel.PERSON)
+    accumulator = _get_or_create_personal_accumulator(
+        session,
+        organization,
+        user,
+        epoch_assignment,
+        branch=branch_score.branch,
+        assessment=assessment,
+        admission_parent=parent,
+        active_personal_profile=active_personal,
+    )
+    quarantine_until, eligible_on = quarantine_window(assessment.day, policy)
+    candidate = SafeUpdateCandidate(
+        organization_id=organization.id,
+        user_id=user.id,
+        role_assignment_id=epoch_assignment.id,
+        reference_profile_id=accumulator.active_reference_profile_id,
+        source_assessment_id=assessment.id,
+        accumulator_id=accumulator.id,
+        source_branch_score_id=branch_score.id,
+        source_feature_id=(
+            observation.id if isinstance(observation, UserDayFeature) else None
+        ),
+        source_sequence_id=(
+            observation.id if isinstance(observation, UserDaySequence) else None
+        ),
+        source_input_checksum=observation.input_checksum,
+        admission_reference_profile_id=parent.id,
+        admission_reference_checksum=parent.checksum,
+        admission_percentile=percentile,
+        admission_threshold=policy.admission_max_percentile_exclusive,
+        branch=branch_score.branch,
+        candidate_day=assessment.day,
+        quarantine_until=quarantine_until,
+        eligible_on=eligible_on,
+        status=UpdateStatus.CANDIDATE,
+        reason_codes=["ADMISSION_PASSED"],
+        support_contribution_json=contribution,
+        policy_version=policy.policy_version,
+        model_version=assessment.model_version,
+        config_version=assessment.config_version,
+        influence_cap=policy.per_release_influence_cap,
+    )
+    session.add(candidate)
+    session.flush()
+    append_audit(
+        session,
+        organization,
+        actor=actor,
+        action="safe_update.candidate_created",
+        entity_type="safe_update_candidate",
+        entity_id=str(candidate.id),
+        request_id=request_id,
+        after={
+            "branch": candidate.branch.value,
+            "candidate_day": candidate.candidate_day,
+            "eligible_on": candidate.eligible_on,
+            "parent_reference_profile_id": str(parent.id),
+            "parent_percentile": percentile,
+            "threshold_exclusive": policy.admission_max_percentile_exclusive,
+            "policy_version": policy.policy_version,
+        },
+    )
+    return candidate
+
+
+def _production_person_staleness_gap(
+    session: Session,
+    user: User,
     assignment: RoleAssignment,
     branch: Branch,
-    assessment: AssessmentCreate,
-    payload: BranchAssessmentInput,
-) -> ReferenceProfile | None:
+    score_date: date,
+    profile: ReferenceProfile,
+) -> int:
     epoch_assignment = role_epoch_anchor(session, assignment)
-    explicit = payload.reference_profile_ids.get("PERSON") or payload.reference_profile_ids.get(
-        "person"
-    )
-    if explicit:
-        try:
-            profile = session.get(ReferenceProfile, uuid.UUID(explicit))
-        except ValueError:
-            return None
-        if (
-            profile
-            and profile.level is ReferenceLevel.PERSON
-            and profile.branch is branch
-            and profile.user_id == user.id
-            and profile.role_assignment_id == epoch_assignment.id
-        ):
-            return profile
-        return None
-    return session.scalar(
-        select(ReferenceProfile)
-        .where(
-            ReferenceProfile.organization_id == organization.id,
-            ReferenceProfile.branch == branch,
-            ReferenceProfile.level == ReferenceLevel.PERSON,
-            ReferenceProfile.user_id == user.id,
-            ReferenceProfile.role_assignment_id == epoch_assignment.id,
-            ReferenceProfile.model_version == assessment.model_version,
-            ReferenceProfile.config_version == assessment.config_version,
-            ReferenceProfile.fitted_through <= assessment.day - timedelta(days=1),
+    if branch is Branch.FEATURE:
+        latest_active_day = session.scalar(
+            select(func.max(UserDayFeature.day))
+            .join(FeatureCatalog, FeatureCatalog.id == UserDayFeature.catalog_id)
+            .where(
+                UserDayFeature.user_id == user.id,
+                UserDayFeature.day >= epoch_assignment.valid_from,
+                UserDayFeature.day < score_date,
+                UserDayFeature.is_active_day.is_(True),
+                FeatureCatalog.version == FEATURE_SCHEMA_VERSION,
+            )
         )
-        .order_by(ReferenceProfile.fitted_through.desc())
-        .limit(1)
+    else:
+        latest_active_day = session.scalar(
+            select(func.max(UserDaySequence.day)).where(
+                UserDaySequence.user_id == user.id,
+                UserDaySequence.day >= epoch_assignment.valid_from,
+                UserDaySequence.day < score_date,
+                UserDaySequence.vocabulary_version == SEQUENCE_SCHEMA_VERSION,
+                UserDaySequence.seq_len >= 2,
+            )
+        )
+    stored_last_active = (
+        profile.support_json.get("last_active_day")
+        if branch is Branch.FEATURE
+        else profile.support_json.get("last_sequence_day")
+        or profile.support_json.get("last_active_day")
     )
+    stored_day = (
+        date.fromisoformat(str(stored_last_active))
+        if stored_last_active
+        else profile.fitted_through
+    )
+    latest = max(
+        day_value
+        for day_value in (latest_active_day, stored_day)
+        if day_value is not None
+    )
+    return max((score_date - latest).days, 0)
 
 
 def create_assessment(
@@ -1986,6 +2647,20 @@ def create_assessment(
         feature_context = {"evidence": payload.feature.evidence}
         enforce_label_firewall(feature_context)
         enforce_metadata_only_payload(feature_context)
+        top_features = payload.feature.evidence.get("top_features", [])
+        if top_features:
+            allowed_features = {
+                str(item["name"])
+                for item in load_feature_catalog().get("features", [])
+                if isinstance(item, dict) and item.get("name")
+            }
+            unknown_features = sorted(set(top_features) - allowed_features)
+            if unknown_features:
+                raise DomainValidationError(
+                    "FEATURE_EVIDENCE_UNKNOWN",
+                    "feature evidence contains names outside the active catalog",
+                    {"features": unknown_features},
+                )
     if payload.sequence is not None:
         sequence_context = {"evidence": payload.sequence.evidence}
         enforce_label_firewall(sequence_context)
@@ -2065,6 +2740,14 @@ def create_assessment(
     request_hash = sha256_json(request_snapshot)
 
     user = get_user(session, organization, payload.user_id)
+    _lock_assessment_release(
+        session,
+        organization_id=organization.id,
+        user_id=user.id,
+        day=payload.day,
+        model_version=payload.model_version,
+        config_version=payload.config_version,
+    )
     existing = session.scalar(
         select(RiskAssessment).where(
             RiskAssessment.organization_id == organization.id,
@@ -2089,11 +2772,32 @@ def create_assessment(
             )
         return existing
 
+    closed_watermark = session.scalar(
+        select(ScoringWatermark.id).where(
+            ScoringWatermark.organization_id == organization.id,
+            ScoringWatermark.day == payload.day,
+            ScoringWatermark.model_version == payload.model_version,
+            ScoringWatermark.config_version == payload.config_version,
+        )
+    )
+    if closed_watermark is not None:
+        raise conflict(
+            "SCORING_DAY_ALREADY_CLOSED",
+            "the immutable scoring watermark forbids a new assessment release for this day",
+            {
+                "day": payload.day.isoformat(),
+                "model_version": payload.model_version,
+                "config_version": payload.config_version,
+                "watermark_id": str(closed_watermark),
+            },
+        )
+
     assignment = role_assignment_at(session, user.id, payload.day)
     role_known = bool(assignment and not assignment.role.is_unknown)
     scoring_run_id = request_id
     feature_score = None
     sequence_score = None
+    profiles_by_branch: dict[Branch, dict[ReferenceLevel, ReferenceProfile]] = {}
 
     if payload.feature is not None:
         feature_profiles = _profiles_for_branch(
@@ -2105,12 +2809,35 @@ def create_assessment(
             assessment=payload,
             branch_input=payload.feature,
         )
+        profiles_by_branch[Branch.FEATURE] = feature_profiles
         supports = _build_feature_supports(feature_profiles, role_known)
+        if (
+            payload.split == "PRODUCTION"
+            and assignment is not None
+            and supports[0] is not None
+            and ReferenceLevel.PERSON in feature_profiles
+        ):
+            supports = (
+                replace(
+                    supports[0],
+                    last_active_gap_days=_production_person_staleness_gap(
+                        session,
+                        user,
+                        assignment,
+                        Branch.FEATURE,
+                        payload.day,
+                        feature_profiles[ReferenceLevel.PERSON],
+                    ),
+                ),
+                supports[1],
+                supports[2],
+            )
         feature_decision = select_feature_reference(
             score_date=payload.day,
             person=supports[0],
             role=supports[1],
             global_support=supports[2],
+            config=framework_config,
         )
         feature_score = _persist_branch_score(
             session,
@@ -2139,13 +2866,36 @@ def create_assessment(
             assessment=payload,
             branch_input=payload.sequence,
         )
+        profiles_by_branch[Branch.SEQUENCE] = sequence_profiles
         supports = _build_sequence_supports(sequence_profiles, role_known)
+        if (
+            payload.split == "PRODUCTION"
+            and assignment is not None
+            and supports[0] is not None
+            and ReferenceLevel.PERSON in sequence_profiles
+        ):
+            supports = (
+                replace(
+                    supports[0],
+                    last_active_gap_days=_production_person_staleness_gap(
+                        session,
+                        user,
+                        assignment,
+                        Branch.SEQUENCE,
+                        payload.day,
+                        sequence_profiles[ReferenceLevel.PERSON],
+                    ),
+                ),
+                supports[1],
+                supports[2],
+            )
         sequence_decision = select_sequence_reference(
             score_date=payload.day,
             seq_len=payload.sequence.seq_len,
             person=supports[0],
             role=supports[1],
             global_support=supports[2],
+            config=framework_config,
         )
         sequence_score = _persist_branch_score(
             session,
@@ -2228,43 +2978,39 @@ def create_assessment(
             )
         )
 
-    safe_update_config = load_framework_config()["safe_personalized_update"]
-    quarantine_days = int(safe_update_config["quarantine_days"])
+    safe_update_config = framework_config["safe_personalized_update"]
+    safe_update_policy_version = safe_update_config.get("policy_version")
     safe_update_enabled = (
         payload.split == "PRODUCTION"
         and bool(safe_update_config.get("production_enabled", True))
+        and payload.config_version == str(framework_config["schema_version"])
+        and isinstance(safe_update_policy_version, str)
+        and safe_update_policy_version.startswith("framework.v5.")
     )
     if assignment is not None and safe_update_enabled:
         epoch_assignment = role_epoch_anchor(session, assignment)
-        for branch, branch_input in (
-            (Branch.FEATURE, payload.feature),
-            (Branch.SEQUENCE, payload.sequence),
+        policy = SafeUpdatePolicy.from_framework(framework_config)
+        for branch, branch_input, branch_score in (
+            (Branch.FEATURE, payload.feature, feature_score),
+            (Branch.SEQUENCE, payload.sequence, sequence_score),
         ):
-            if branch_input is None:
+            if branch_input is None or branch_score is None:
                 continue
-            personal_profile = _personal_profile_for_candidate(
+            _record_safe_update_admission(
                 session,
                 organization,
                 user,
-                assignment,
-                branch,
-                payload,
-                branch_input,
+                epoch_assignment,
+                assessment=assessment,
+                branch_score=branch_score,
+                branch_input=branch_input,
+                profiles=profiles_by_branch[branch],
+                role_known=role_known,
+                framework_config=framework_config,
+                policy=policy,
+                actor=actor,
+                request_id=request_id,
             )
-            if personal_profile is not None:
-                session.add(
-                    SafeUpdateCandidate(
-                        organization_id=organization.id,
-                        user_id=user.id,
-                        role_assignment_id=epoch_assignment.id,
-                        reference_profile_id=personal_profile.id,
-                        source_assessment_id=assessment.id,
-                        branch=branch,
-                        candidate_day=payload.day,
-                        quarantine_until=payload.day + timedelta(days=quarantine_days),
-                        status=UpdateStatus.CANDIDATE,
-                    )
-                )
     session.flush()
     append_audit(
         session,
@@ -2442,85 +3188,1083 @@ def patch_alert(
     return alert, assessment, user
 
 
-def process_safe_updates(
+def close_scoring_day(
     session: Session,
     organization: Organization,
     *,
-    through_date: date,
-    limit: int,
+    day: date,
+    model_version: str,
+    config_version: str,
     actor: str,
     request_id: str,
-) -> tuple[int, int, int]:
-    statement = (
-        select(SafeUpdateCandidate)
-        .where(
-            SafeUpdateCandidate.organization_id == organization.id,
-            SafeUpdateCandidate.status == UpdateStatus.CANDIDATE,
-            SafeUpdateCandidate.quarantine_until <= through_date,
+) -> ScoringWatermark:
+    framework_config = load_framework_config()
+    active_config_version = str(framework_config["schema_version"])
+    if config_version != active_config_version:
+        raise DomainValidationError(
+            "WATERMARK_CONFIG_NOT_ACTIVE",
+            "a scoring watermark can only close the active framework release",
+            {"active": active_config_version, "provided": config_version},
         )
-        .order_by(SafeUpdateCandidate.quarantine_until)
-        .limit(limit)
-        .with_for_update(skip_locked=True)
-    )
-    candidates = list(session.scalars(statement))
-    accepted = 0
-    rejected = 0
-    for candidate in candidates:
-        assessment = session.get(RiskAssessment, candidate.source_assessment_id)
-        reasons: list[str] = []
-        if assessment is None:
-            reasons.append("SOURCE_ASSESSMENT_MISSING")
-        else:
-            if assessment.split is not DataSplit.PRODUCTION:
-                reasons.append("PRIMARY_EXPERIMENT_UPDATE_FORBIDDEN")
-            if assessment.is_alert:
-                reasons.append("DAY_IS_ALERT")
-            quarantine_alert = session.scalar(
-                select(RiskAssessment.id).where(
-                    RiskAssessment.organization_id == organization.id,
-                    RiskAssessment.user_id == candidate.user_id,
-                    RiskAssessment.is_alert.is_(True),
-                    RiskAssessment.day >= candidate.candidate_day,
-                    RiskAssessment.day <= candidate.quarantine_until,
+    if dataset_split(day) != "PRODUCTION":
+        raise DomainValidationError(
+            "WATERMARK_PRODUCTION_ONLY",
+            "safe-update scoring watermarks are production-only",
+            {"day": day.isoformat()},
+        )
+
+    universe_ids = sorted(
+        {
+            str(user_id)
+            for user_id in session.scalars(
+                select(RoleAssignment.user_id)
+                .join(User, User.id == RoleAssignment.user_id)
+                .where(
+                    User.organization_id == organization.id,
+                    RoleAssignment.valid_from <= day,
+                    or_(RoleAssignment.valid_to.is_(None), RoleAssignment.valid_to > day),
                 )
             )
-            if quarantine_alert is not None:
-                reasons.append("ALERT_IN_QUARANTINE_WINDOW")
-            current_assignment = role_assignment_at(session, candidate.user_id, through_date)
-            current_epoch = (
-                role_epoch_anchor(session, current_assignment)
-                if current_assignment is not None
-                else None
+        }
+    )
+    assessments = list(
+        session.scalars(
+            select(RiskAssessment).where(
+                RiskAssessment.organization_id == organization.id,
+                RiskAssessment.day == day,
+                RiskAssessment.model_version == model_version,
+                RiskAssessment.config_version == config_version,
             )
-            if current_epoch is None or current_epoch.id != candidate.role_assignment_id:
-                reasons.append("ROLE_EPOCH_CHANGED")
-        if reasons:
-            candidate.status = UpdateStatus.REJECTED
-            candidate.reason_codes = reasons
-            rejected += 1
+        )
+    )
+    assessment_user_ids = {str(item.user_id) for item in assessments}
+    universe_id_set = set(universe_ids)
+    if assessment_user_ids != universe_id_set:
+        raise DomainValidationError(
+            "SCORING_DAY_INCOMPLETE",
+            "the persisted assessment set does not exactly match the effective-dated role universe",
+            {
+                "day": day.isoformat(),
+                "expected_assessments": len(universe_ids),
+                "persisted_assessments": len(assessments),
+                "missing_user_ids": sorted(universe_id_set - assessment_user_ids),
+                "unexpected_user_ids": sorted(assessment_user_ids - universe_id_set),
+            },
+        )
+    if any(item.split is not DataSplit.PRODUCTION for item in assessments):
+        raise DomainValidationError(
+            "WATERMARK_NON_PRODUCTION_ASSESSMENT",
+            "the watermark set contains a non-production assessment",
+        )
+
+    universe_checksum = sha256_json(universe_ids)
+    assessment_set_checksum = sha256_json(
+        [
+            {
+                "assessment_id": str(item.id),
+                "user_id": str(item.user_id),
+                "status": item.status.value,
+                "is_alert": item.is_alert,
+            }
+            for item in sorted(assessments, key=lambda value: str(value.user_id))
+        ]
+    )
+    existing = session.scalar(
+        select(ScoringWatermark).where(
+            ScoringWatermark.organization_id == organization.id,
+            ScoringWatermark.day == day,
+            ScoringWatermark.model_version == model_version,
+            ScoringWatermark.config_version == config_version,
+        )
+    )
+    if existing is not None:
+        if (
+            existing.universe_checksum != universe_checksum
+            or existing.assessment_set_checksum != assessment_set_checksum
+            or existing.expected_assessments != len(universe_ids)
+            or existing.persisted_assessments != len(assessments)
+        ):
+            raise conflict(
+                "WATERMARK_RELEASE_CONFLICT",
+                "the immutable scoring watermark already exists with different evidence",
+                {"watermark_id": str(existing.id), "day": day.isoformat()},
+            )
+        return existing
+
+    watermark = ScoringWatermark(
+        organization_id=organization.id,
+        day=day,
+        model_version=model_version,
+        config_version=config_version,
+        expected_assessments=len(universe_ids),
+        persisted_assessments=len(assessments),
+        universe_checksum=universe_checksum,
+        assessment_set_checksum=assessment_set_checksum,
+        completed_at=utc_now(),
+    )
+    session.add(watermark)
+    session.flush()
+    append_audit(
+        session,
+        organization,
+        actor=actor,
+        action="scoring_watermark.closed",
+        entity_type="scoring_watermark",
+        entity_id=str(watermark.id),
+        request_id=request_id,
+        after={
+            "day": day,
+            "model_version": model_version,
+            "config_version": config_version,
+            "expected_assessments": len(universe_ids),
+            "assessment_set_checksum": assessment_set_checksum,
+        },
+    )
+    return watermark
+
+
+def _quarantine_watermarks_complete(
+    session: Session,
+    organization: Organization,
+    candidate: SafeUpdateCandidate,
+    policy: SafeUpdatePolicy,
+) -> bool:
+    watermark_count = session.scalar(
+        select(func.count(ScoringWatermark.id)).where(
+            ScoringWatermark.organization_id == organization.id,
+            ScoringWatermark.model_version == candidate.model_version,
+            ScoringWatermark.config_version == candidate.config_version,
+            ScoringWatermark.day >= candidate.candidate_day,
+            ScoringWatermark.day <= candidate.quarantine_until,
+        )
+    )
+    return int(watermark_count or 0) == policy.quarantine_days + 1
+
+
+def _candidate_source_is_unchanged(
+    session: Session,
+    candidate: SafeUpdateCandidate,
+) -> bool:
+    source: UserDayFeature | UserDaySequence | None
+    if candidate.branch is Branch.FEATURE:
+        source = (
+            session.get(UserDayFeature, candidate.source_feature_id)
+            if candidate.source_feature_id
+            else None
+        )
+    else:
+        source = (
+            session.get(UserDaySequence, candidate.source_sequence_id)
+            if candidate.source_sequence_id
+            else None
+        )
+    return bool(
+        source is not None
+        and source.user_id == candidate.user_id
+        and source.day == candidate.candidate_day
+        and source.input_checksum == candidate.source_input_checksum
+    )
+
+
+def _candidate_integrity_reasons(
+    session: Session,
+    organization: Organization,
+    candidate: SafeUpdateCandidate,
+    *,
+    latest_watermark_day: date,
+    policy: SafeUpdatePolicy,
+) -> list[str]:
+    reasons: list[str] = []
+    assessment = session.get(RiskAssessment, candidate.source_assessment_id)
+    branch_score = (
+        session.get(BranchScore, candidate.source_branch_score_id)
+        if candidate.source_branch_score_id
+        else None
+    )
+    parent = (
+        session.get(ReferenceProfile, candidate.admission_reference_profile_id)
+        if candidate.admission_reference_profile_id
+        else None
+    )
+    if assessment is None:
+        reasons.append("SOURCE_ASSESSMENT_MISSING")
+    else:
+        if assessment.organization_id != organization.id:
+            reasons.append("SOURCE_ORGANIZATION_MISMATCH")
+        if assessment.split is not DataSplit.PRODUCTION:
+            reasons.append("PRIMARY_EXPERIMENT_UPDATE_FORBIDDEN")
+        if assessment.status is not AssessmentStatus.SCORED:
+            reasons.append("SOURCE_ASSESSMENT_NOT_SCORED")
+        if assessment.is_alert:
+            reasons.append("DAY_IS_ALERT")
+        if (
+            assessment.model_version != candidate.model_version
+            or assessment.config_version != candidate.config_version
+        ):
+            reasons.append("SOURCE_RELEASE_MISMATCH")
+    if (
+        branch_score is None
+        or branch_score.status is not ScoreStatus.SCORED
+        or branch_score.raw_score is None
+        or branch_score.user_id != candidate.user_id
+        or branch_score.day != candidate.candidate_day
+        or branch_score.branch is not candidate.branch
+    ):
+        reasons.append("SOURCE_BRANCH_SCORE_INVALID")
+    if not _candidate_source_is_unchanged(session, candidate):
+        reasons.append("SOURCE_USER_DAY_CHANGED")
+    if (
+        parent is None
+        or parent.level not in {ReferenceLevel.ROLE, ReferenceLevel.GLOBAL}
+        or parent.branch is not candidate.branch
+        or not parent.is_frozen
+        or parent.checksum != candidate.admission_reference_checksum
+    ):
+        reasons.append("ADMISSION_PARENT_CHANGED_OR_INVALID")
+    elif branch_score is not None and branch_score.raw_score is not None:
+        try:
+            recalculated = empirical_percentile(
+                float(branch_score.raw_score),
+                parent.calibrator_json["sorted_scores"],
+            )
+        except (KeyError, TypeError, ValueError):
+            reasons.append("ADMISSION_PARENT_CALIBRATOR_INVALID")
         else:
-            candidate.status = UpdateStatus.ACCEPTED
-            candidate.reason_codes = ["QUARANTINE_PASSED"]
-            accepted += 1
-        candidate.updated_at = utc_now()
+            if (
+                candidate.admission_percentile is None
+                or not math.isclose(
+                    recalculated,
+                    candidate.admission_percentile,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                or candidate.admission_threshold is None
+                or not math.isclose(
+                    candidate.admission_threshold,
+                    policy.admission_max_percentile_exclusive,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                or not admission_allowed(
+                    recalculated,
+                    policy.admission_max_percentile_exclusive,
+                )
+            ):
+                reasons.append("ADMISSION_SNAPSHOT_INVALID")
+
+    quarantine_alert = session.scalar(
+        select(RiskAssessment.id).where(
+            RiskAssessment.organization_id == organization.id,
+            RiskAssessment.user_id == candidate.user_id,
+            RiskAssessment.is_alert.is_(True),
+            RiskAssessment.day >= candidate.candidate_day,
+            RiskAssessment.day <= candidate.quarantine_until,
+        )
+    )
+    if quarantine_alert is not None:
+        reasons.append("ALERT_IN_QUARANTINE_WINDOW")
+
+    for checkpoint_day in (candidate.quarantine_until, latest_watermark_day):
+        assignment = role_assignment_at(session, candidate.user_id, checkpoint_day)
+        epoch = role_epoch_anchor(session, assignment) if assignment is not None else None
+        if epoch is None or epoch.id != candidate.role_assignment_id:
+            reasons.append("ROLE_EPOCH_CHANGED")
+            break
+    return sorted(set(reasons))
+
+
+def _candidate_raw_scores(
+    session: Session,
+    candidates: Sequence[SafeUpdateCandidate],
+) -> list[float]:
+    scores: list[float] = []
+    for candidate in candidates:
+        score = session.get(BranchScore, candidate.source_branch_score_id)
+        if score is None or score.raw_score is None or not math.isfinite(score.raw_score):
+            raise RuntimeError("accepted safe-update candidate lost its immutable raw score")
+        scores.append(float(score.raw_score))
+    return scores
+
+
+def _feature_candidate_support(
+    candidates: Sequence[SafeUpdateCandidate],
+) -> tuple[FeatureBootstrapSupport, list[int]]:
+    if not candidates:
+        return FeatureBootstrapSupport(0, 0, 0, 0.0, 0), []
+    dimension = int(candidates[0].support_contribution_json.get("feature_dimension", 0))
+    if dimension < 1:
+        return FeatureBootstrapSupport(0, 0, 0, 0.0, 0), []
+    counts = [0] * dimension
+    for candidate in candidates:
+        contribution = candidate.support_contribution_json
+        if int(contribution.get("feature_dimension", 0)) != dimension:
+            return FeatureBootstrapSupport(0, 0, 0, 0.0, 0), []
+        ordinals = contribution.get("present_ordinals", [])
+        if not isinstance(ordinals, list):
+            return FeatureBootstrapSupport(0, 0, 0, 0.0, 0), []
+        for ordinal in ordinals:
+            index = int(ordinal) - 1
+            if index < 0 or index >= dimension:
+                return FeatureBootstrapSupport(0, 0, 0, 0.0, 0), []
+            counts[index] += 1
+    active_days = len(candidates)
+    span_days = (candidates[-1].candidate_day - candidates[0].candidate_day).days + 1
+    used_counts = [value for value in counts if value > 0]
+    coverage = sum(counts) / (active_days * dimension)
+    support = FeatureBootstrapSupport(
+        active_days=active_days,
+        span_days=span_days,
+        active_days_current_role=active_days,
+        coverage=coverage,
+        min_feature_observations=min(used_counts) if used_counts else 0,
+    )
+    return support, counts
+
+
+def _sequence_candidate_support(
+    candidates: Sequence[SafeUpdateCandidate],
+) -> SequenceBootstrapSupport:
+    if not candidates:
+        return SequenceBootstrapSupport(0, 0, 0, 0)
+    transitions = sum(
+        int(candidate.support_contribution_json.get("transitions", 0))
+        for candidate in candidates
+    )
+    return SequenceBootstrapSupport(
+        sequence_days=len(candidates),
+        span_days=(candidates[-1].candidate_day - candidates[0].candidate_day).days + 1,
+        sequence_days_current_role=len(candidates),
+        transitions=transitions,
+    )
+
+
+def _bootstrap_candidate_prefix(
+    candidates: Sequence[SafeUpdateCandidate],
+    *,
+    branch: Branch,
+    framework_config: Mapping[str, Any],
+) -> list[SafeUpdateCandidate]:
+    selected: list[SafeUpdateCandidate] = []
+    for candidate in candidates:
+        selected.append(candidate)
+        if branch is Branch.FEATURE:
+            support, _ = _feature_candidate_support(selected)
+            decision = feature_bootstrap_readiness(support, framework_config)
+        else:
+            support = _sequence_candidate_support(selected)
+            decision = sequence_bootstrap_readiness(support, framework_config)
+        if decision.ready:
+            return selected
+    return []
+
+
+def _profile_personal_scores(profile: ReferenceProfile) -> list[float]:
+    method = profile.calibrator_json.get("method")
+    if method == "empirical_cdf.v1":
+        values = profile.calibrator_json.get("sorted_scores")
+    elif method == "parent_shrunk_ecdf.v1":
+        values = profile.calibrator_json.get("personal_sorted_scores")
+    else:
+        raise RuntimeError("active Personal reference has an unsupported calibrator")
+    if not isinstance(values, list) or not values:
+        raise RuntimeError("active Personal reference has no calibration scores")
+    normalized = [float(value) for value in values]
+    if any(not math.isfinite(value) for value in normalized):
+        raise RuntimeError("active Personal reference contains non-finite scores")
+    return normalized
+
+
+def _child_support_snapshot(
+    *,
+    accumulator: PersonalReferenceAccumulator,
+    parent: ReferenceProfile | None,
+    candidates: Sequence[SafeUpdateCandidate],
+    release_day: date,
+) -> tuple[dict[str, Any], int, int, float | None, date]:
+    first_day = candidates[0].candidate_day
+    last_day = candidates[-1].candidate_day
+    parent_first_raw = None
+    if parent is not None:
+        parent_first_raw = (
+            parent.support_json.get("first_active_day")
+            if accumulator.branch is Branch.FEATURE
+            else parent.support_json.get("first_sequence_day")
+            or parent.support_json.get("first_active_day")
+        )
+    parent_first = (
+        date.fromisoformat(str(parent_first_raw))
+        if parent_first_raw
+        else (parent.fitted_from if parent and parent.fitted_from else None)
+    )
+    if parent is not None and parent_first is None:
+        parent_last_raw = (
+            parent.support_json.get("last_active_day")
+            if accumulator.branch is Branch.FEATURE
+            else parent.support_json.get("last_sequence_day")
+            or parent.support_json.get("last_active_day")
+        )
+        parent_last = (
+            date.fromisoformat(str(parent_last_raw))
+            if parent_last_raw
+            else parent.fitted_through
+        )
+        parent_span_days = max(int(parent.support_json.get("span_days", 1)), 1)
+        parent_first = parent_last - timedelta(days=parent_span_days - 1)
+    fitted_from = min(value for value in (parent_first, first_day) if value is not None)
+    parent_days = parent.support_days if parent else 0
+    support_days = parent_days + len(candidates)
+    span_days = (last_day - fitted_from).days + 1
+
+    if accumulator.branch is Branch.FEATURE:
+        _, new_counts = _feature_candidate_support(candidates)
+        if not new_counts:
+            raise RuntimeError("accepted Feature candidates have invalid support evidence")
+        if parent is not None:
+            stored_counts = parent.support_json.get("feature_observation_counts")
+            if not isinstance(stored_counts, list) or len(stored_counts) != len(new_counts):
+                raise RuntimeError(
+                    "incremental Feature release requires parent observation counts"
+                )
+            counts = [
+                int(previous) + current
+                for previous, current in zip(stored_counts, new_counts, strict=True)
+            ]
+            parent_observation_days = int(
+                parent.support_json.get("feature_observation_days")
+                or parent.support_json.get("observations")
+                or parent.support_days
+            )
+        else:
+            counts = new_counts
+            parent_observation_days = 0
+        observation_days = parent_observation_days + len(candidates)
+        used_counts = [value for value in counts if value > 0]
+        if observation_days < 1 or any(value > observation_days for value in counts):
+            raise RuntimeError("Feature observation counts exceed their day denominator")
+        coverage = sum(counts) / (observation_days * len(counts))
+        support_json = {
+            "active_days": support_days,
+            "span_days": span_days,
+            "active_days_current_role": support_days,
+            "coverage": coverage,
+            "min_feature_observations": min(used_counts) if used_counts else 0,
+            "feature_observation_counts": counts,
+            "feature_observation_days": observation_days,
+            "feature_dimension": len(counts),
+            "first_active_day": fitted_from.isoformat(),
+            "last_active_day": last_day.isoformat(),
+            "last_active_gap_days": max((release_day - last_day).days, 0),
+            "support_source": "accepted_safe_update_candidates",
+        }
+        return support_json, support_days, 0, coverage, fitted_from
+
+    new_transitions = sum(
+        int(candidate.support_contribution_json.get("transitions", 0))
+        for candidate in candidates
+    )
+    support_transitions = (parent.support_transitions if parent else 0) + new_transitions
+    support_json = {
+        "sequence_days": support_days,
+        "transitions": support_transitions,
+        "span_days": span_days,
+        "sequence_days_current_role": support_days,
+        "first_active_day": fitted_from.isoformat(),
+        "first_sequence_day": fitted_from.isoformat(),
+        "last_active_day": last_day.isoformat(),
+        "last_sequence_day": last_day.isoformat(),
+        "last_active_gap_days": max((release_day - last_day).days, 0),
+        "support_source": "accepted_safe_update_candidates",
+    }
+    return support_json, support_days, support_transitions, None, fitted_from
+
+
+def _materialize_accumulator(
+    session: Session,
+    organization: Organization,
+    accumulator_id: uuid.UUID,
+    *,
+    logical_day: date,
+    framework_config: Mapping[str, Any],
+    policy: SafeUpdatePolicy,
+    actor: str,
+    request_id: str,
+) -> int:
+    accumulator = session.scalar(
+        select(PersonalReferenceAccumulator)
+        .where(
+            PersonalReferenceAccumulator.id == accumulator_id,
+            PersonalReferenceAccumulator.organization_id == organization.id,
+        )
+        .with_for_update()
+    )
+    if accumulator is None or accumulator.status in {
+        PersonalAccumulatorStatus.CLOSED,
+        PersonalAccumulatorStatus.COMPROMISED,
+    }:
+        return 0
+    current_assignment = role_assignment_at(
+        session,
+        accumulator.user_id,
+        logical_day - timedelta(days=1),
+    )
+    current_epoch = (
+        role_epoch_anchor(session, current_assignment)
+        if current_assignment is not None
+        else None
+    )
+    if current_epoch is None or current_epoch.id != accumulator.role_assignment_id:
+        accumulator.status = PersonalAccumulatorStatus.CLOSED
+        stranded = list(
+            session.scalars(
+                select(SafeUpdateCandidate)
+                .where(
+                    SafeUpdateCandidate.accumulator_id == accumulator.id,
+                    SafeUpdateCandidate.status == UpdateStatus.ACCEPTED,
+                    SafeUpdateCandidate.policy_version == policy.policy_version,
+                    SafeUpdateCandidate.model_version == accumulator.model_version,
+                    SafeUpdateCandidate.config_version == accumulator.config_version,
+                )
+                .with_for_update()
+            )
+        )
+        for candidate in stranded:
+            candidate.status = UpdateStatus.REJECTED
+            candidate.reason_codes = ["ROLE_EPOCH_CHANGED"]
+            candidate.decision_at = utc_now()
+            append_audit(
+                session,
+                organization,
+                actor=actor,
+                action="safe_update.rejected",
+                entity_type="safe_update_candidate",
+                entity_id=str(candidate.id),
+                request_id=request_id,
+                after={
+                    "status": candidate.status.value,
+                    "reason_codes": candidate.reason_codes,
+                    "decision_at": candidate.decision_at,
+                    "policy_version": candidate.policy_version,
+                },
+            )
+            session.flush()
         append_audit(
             session,
             organization,
             actor=actor,
-            action=f"safe_update.{candidate.status.value}",
+            action="safe_update.accumulator_closed",
+            entity_type="personal_reference_accumulator",
+            entity_id=str(accumulator.id),
+            request_id=request_id,
+            after={"reason_code": "ROLE_EPOCH_CHANGED", "logical_day": logical_day},
+        )
+        session.flush()
+        return 0
+    if (
+        accumulator.last_release_day is not None
+        and (logical_day - accumulator.last_release_day).days < policy.release_interval_days
+    ):
+        return 0
+
+    candidates = list(
+        session.scalars(
+            select(SafeUpdateCandidate)
+            .where(
+                SafeUpdateCandidate.accumulator_id == accumulator.id,
+                SafeUpdateCandidate.status == UpdateStatus.ACCEPTED,
+                SafeUpdateCandidate.policy_version == policy.policy_version,
+                SafeUpdateCandidate.model_version == accumulator.model_version,
+                SafeUpdateCandidate.config_version == accumulator.config_version,
+                SafeUpdateCandidate.eligible_on.is_not(None),
+                SafeUpdateCandidate.eligible_on <= logical_day,
+            )
+            .order_by(SafeUpdateCandidate.candidate_day, SafeUpdateCandidate.id)
+            .with_for_update()
+        )
+    )
+    revalidated: list[SafeUpdateCandidate] = []
+    for candidate in candidates:
+        if not _quarantine_watermarks_complete(
+            session,
+            organization,
+            candidate,
+            policy,
+        ):
+            continue
+        reasons = _candidate_integrity_reasons(
+            session,
+            organization,
+            candidate,
+            latest_watermark_day=logical_day - timedelta(days=1),
+            policy=policy,
+        )
+        if not reasons:
+            revalidated.append(candidate)
+            continue
+        candidate.status = UpdateStatus.REJECTED
+        candidate.reason_codes = ["PRE_MATERIALIZATION_REVALIDATION_FAILED", *reasons]
+        candidate.decision_at = utc_now()
+        append_audit(
+            session,
+            organization,
+            actor=actor,
+            action="safe_update.rejected",
             entity_type="safe_update_candidate",
             entity_id=str(candidate.id),
             request_id=request_id,
-            after={"status": candidate.status.value, "reasons": candidate.reason_codes},
+            after={
+                "status": candidate.status.value,
+                "reason_codes": candidate.reason_codes,
+                "decision_at": candidate.decision_at,
+                "policy_version": policy.policy_version,
+            },
         )
+        session.flush()
+    candidates = revalidated
     session.flush()
-    pending = session.scalar(
-        select(func.count(SafeUpdateCandidate.id)).where(
-            SafeUpdateCandidate.organization_id == organization.id,
-            SafeUpdateCandidate.status == UpdateStatus.CANDIDATE,
+    if not candidates:
+        return 0
+
+    parent = (
+        session.get(ReferenceProfile, accumulator.active_reference_profile_id)
+        if accumulator.active_reference_profile_id
+        else None
+    )
+    parent_personal_scores = _profile_personal_scores(parent) if parent else []
+    effective_parent_support = len(parent_personal_scores)
+    recent_release_rows: list[ReferenceRelease] = []
+    rolling_anchor_support = effective_parent_support
+    rolling_applied_before = 0
+    if parent is None:
+        chosen = _bootstrap_candidate_prefix(
+            candidates,
+            branch=accumulator.branch,
+            framework_config=framework_config,
+        )
+        if not chosen:
+            return 0
+        release_kind = ReferenceReleaseKind.BOOTSTRAP
+        parent_support = 0
+        influence_ratio = 1.0
+    else:
+        recent_release_rows = list(
+            session.scalars(
+                select(ReferenceRelease).where(
+                    ReferenceRelease.accumulator_id == accumulator.id,
+                    ReferenceRelease.kind == ReferenceReleaseKind.INCREMENTAL,
+                    ReferenceRelease.release_day
+                    >= logical_day - timedelta(days=policy.rolling_window_days - 1),
+                    ReferenceRelease.release_day <= logical_day,
+                )
+            )
+        )
+        capacity = bounded_release_capacity(
+            logical_day=logical_day,
+            parent_support=effective_parent_support,
+            recent_releases=[
+                ReleaseWindowEntry(
+                    release_day=item.release_day,
+                    parent_support=item.parent_support,
+                    applied_candidate_count=item.applied_candidate_count,
+                )
+                for item in recent_release_rows
+            ],
+            policy=policy,
+        )
+        if capacity < 1:
+            return 0
+        chosen = candidates[:capacity]
+        release_kind = ReferenceReleaseKind.INCREMENTAL
+        parent_support = effective_parent_support
+        influence_ratio = len(chosen) / effective_parent_support
+        rolling_anchor_support = min(
+            [parent_support, *(item.parent_support for item in recent_release_rows)]
+        )
+        rolling_applied_before = sum(
+            item.applied_candidate_count for item in recent_release_rows
+        )
+
+    calibration_parent = session.get(
+        ReferenceProfile,
+        accumulator.admission_reference_profile_id,
+    )
+    if (
+        calibration_parent is None
+        or calibration_parent.level not in {ReferenceLevel.ROLE, ReferenceLevel.GLOBAL}
+        or not calibration_parent.is_frozen
+    ):
+        raise RuntimeError("accumulator calibration parent is missing or invalid")
+    new_scores = _candidate_raw_scores(session, chosen)
+    personal_scores = [*parent_personal_scores, *new_scores]
+    personal_scores.sort()
+    support_json, support_days, support_transitions, coverage, fitted_from = (
+        _child_support_snapshot(
+            accumulator=accumulator,
+            parent=parent,
+            candidates=chosen,
+            release_day=logical_day,
         )
     )
-    return accepted, rejected, int(pending or 0)
+    release_sequence = accumulator.release_sequence + 1
+    calibrator = build_personal_calibrator(
+        personal_scores,
+        parent_reference_profile_id=str(calibration_parent.id),
+        parent_reference_checksum=calibration_parent.checksum,
+        standalone_min_safe_scores=policy.standalone_min_safe_scores,
+    )
+    statistics = {
+        **robust_score_statistics(personal_scores),
+        "release_sequence": release_sequence,
+        "release_kind": release_kind.value,
+        "policy_version": policy.policy_version,
+    }
+    manifest = {
+        "accumulator_id": str(accumulator.id),
+        "release_sequence": release_sequence,
+        "candidate_ids": [str(item.id) for item in chosen],
+        "candidate_days": [item.candidate_day.isoformat() for item in chosen],
+        "source_branch_score_ids": [
+            str(item.source_branch_score_id) for item in chosen
+        ],
+        "source_input_checksums": [item.source_input_checksum for item in chosen],
+        "admission_reference_profile_ids": [
+            str(item.admission_reference_profile_id) for item in chosen
+        ],
+        "admission_percentiles": [item.admission_percentile for item in chosen],
+        "policy_version": policy.policy_version,
+    }
+    checksum = sha256_json(
+        {
+            "organization_id": str(organization.id),
+            "branch": accumulator.branch.value,
+            "scope_key": f"person:{accumulator.role_assignment_id}",
+            "model_version": accumulator.model_version,
+            "config_version": accumulator.config_version,
+            "catalog_version": accumulator.catalog_version,
+            "fitted_from": fitted_from,
+            "fitted_through": chosen[-1].candidate_day,
+            "support": support_json,
+            "statistics": statistics,
+            "calibrator": calibrator,
+            "parent_reference_profile_id": str(parent.id) if parent else None,
+            "calibration_parent_profile_id": str(calibration_parent.id),
+            "release_day": logical_day,
+            "manifest": manifest,
+        }
+    )
+    child = ReferenceProfile(
+        organization_id=organization.id,
+        branch=accumulator.branch,
+        level=ReferenceLevel.PERSON,
+        scope_key=f"person:{accumulator.role_assignment_id}",
+        user_id=accumulator.user_id,
+        role_assignment_id=accumulator.role_assignment_id,
+        model_version=accumulator.model_version,
+        config_version=accumulator.config_version,
+        catalog_version=accumulator.catalog_version,
+        fitted_from=fitted_from,
+        fitted_through=chosen[-1].candidate_day,
+        support_days=support_days,
+        support_users=1,
+        support_transitions=support_transitions,
+        coverage=coverage,
+        support_json=support_json,
+        statistics_json=statistics,
+        calibrator_json=calibrator,
+        parent_reference_profile_id=parent.id if parent else None,
+        calibration_parent_profile_id=calibration_parent.id,
+        reference_version=release_sequence,
+        release_kind=release_kind,
+        release_day=logical_day,
+        release_influence_ratio=influence_ratio,
+        policy_version=policy.policy_version,
+        is_frozen=False,
+        checksum=checksum,
+    )
+    session.add(child)
+    session.flush()
+
+    release = ReferenceRelease(
+        organization_id=organization.id,
+        accumulator_id=accumulator.id,
+        release_sequence=release_sequence,
+        kind=release_kind,
+        parent_reference_profile_id=parent.id if parent else None,
+        calibration_parent_profile_id=calibration_parent.id,
+        child_reference_profile_id=child.id,
+        release_day=logical_day,
+        parent_support=parent_support,
+        applied_candidate_count=len(chosen),
+        influence_ratio=influence_ratio,
+        rolling_anchor_support=rolling_anchor_support,
+        rolling_applied_count_before=rolling_applied_before,
+        policy_version=policy.policy_version,
+        candidate_manifest_json=manifest,
+        manifest_checksum=sha256_json(manifest),
+        released_at=utc_now(),
+    )
+    session.add(release)
+    session.flush()
+
+    now = utc_now()
+    for candidate in chosen:
+        candidate.status = UpdateStatus.APPLIED
+        candidate.reason_codes = [*candidate.reason_codes, "IMMUTABLE_REFERENCE_RELEASED"]
+        candidate.applied_at = now
+        candidate.before_checksum = (
+            parent.checksum if parent else calibration_parent.checksum
+        )
+        candidate.after_checksum = child.checksum
+        candidate.materialized_reference_profile_id = child.id
+        candidate.reference_release_id = release.id
+    accumulator.active_reference_profile_id = child.id
+    accumulator.status = PersonalAccumulatorStatus.ACTIVE
+    accumulator.release_sequence = release_sequence
+    accumulator.last_release_day = logical_day
+    session.flush()
+    append_audit(
+        session,
+        organization,
+        actor=actor,
+        action="safe_update.reference_released",
+        entity_type="reference_release",
+        entity_id=str(release.id),
+        request_id=request_id,
+        after={
+            "accumulator_id": str(accumulator.id),
+            "child_reference_profile_id": str(child.id),
+            "release_sequence": release_sequence,
+            "release_kind": release_kind.value,
+            "applied_candidate_count": len(chosen),
+            "influence_ratio": influence_ratio,
+            "manifest_checksum": release.manifest_checksum,
+        },
+    )
+    return len(chosen)
+
+
+def process_safe_updates(
+    session: Session,
+    organization: Organization,
+    *,
+    model_version: str,
+    config_version: str,
+    runtime_materialization_enabled: bool,
+    limit: int,
+    actor: str,
+    request_id: str,
+) -> dict[str, int]:
+    framework_config = load_framework_config()
+    if config_version != str(framework_config["schema_version"]):
+        raise DomainValidationError(
+            "SAFE_UPDATE_CONFIG_NOT_ACTIVE",
+            "safe-update processing can only target the active v5 framework release",
+            {
+                "active": str(framework_config["schema_version"]),
+                "provided": config_version,
+            },
+        )
+    policy = SafeUpdatePolicy.from_framework(framework_config)
+    materialization_enabled = (
+        policy.materialization_enabled and runtime_materialization_enabled
+    )
+    legacy_pending = int(
+        session.scalar(
+            select(func.count(SafeUpdateCandidate.id)).where(
+                SafeUpdateCandidate.organization_id == organization.id,
+                SafeUpdateCandidate.status.in_(
+                    [UpdateStatus.CANDIDATE, UpdateStatus.ACCEPTED]
+                ),
+                SafeUpdateCandidate.policy_version != policy.policy_version,
+            )
+        )
+        or 0
+    )
+    global_legacy_pending = False
+    if materialization_enabled and policy.activation_requires_zero_pending_legacy_candidates:
+        global_legacy_pending = (
+            session.scalar(
+                select(SafeUpdateCandidate.id)
+                .where(
+                    SafeUpdateCandidate.status.in_(
+                        [UpdateStatus.CANDIDATE, UpdateStatus.ACCEPTED]
+                    ),
+                    SafeUpdateCandidate.policy_version != policy.policy_version,
+                )
+                .limit(1)
+            )
+            is not None
+        )
+    if global_legacy_pending:
+        raise DomainValidationError(
+            "SAFE_UPDATE_LEGACY_PENDING",
+            "immutable v5 materialization requires all legacy candidates to be retired",
+            {
+                "global_legacy_pending": True,
+                "organization_legacy_pending": legacy_pending,
+            },
+        )
+    rejected_before = int(
+        session.scalar(
+            select(func.count(SafeUpdateCandidate.id)).where(
+                SafeUpdateCandidate.organization_id == organization.id,
+                SafeUpdateCandidate.status == UpdateStatus.REJECTED,
+                SafeUpdateCandidate.policy_version == policy.policy_version,
+                SafeUpdateCandidate.model_version == model_version,
+                SafeUpdateCandidate.config_version == config_version,
+            )
+        )
+        or 0
+    )
+    latest_watermark_day = session.scalar(
+        select(func.max(ScoringWatermark.day)).where(
+            ScoringWatermark.organization_id == organization.id,
+            ScoringWatermark.model_version == model_version,
+            ScoringWatermark.config_version == config_version,
+        )
+    )
+    accepted = 0
+    rejected = 0
+    applied = 0
+    if latest_watermark_day is not None:
+        logical_day = latest_watermark_day + timedelta(days=1)
+        candidates = list(
+            session.scalars(
+                select(SafeUpdateCandidate)
+                .where(
+                    SafeUpdateCandidate.organization_id == organization.id,
+                    SafeUpdateCandidate.status == UpdateStatus.CANDIDATE,
+                    SafeUpdateCandidate.policy_version == policy.policy_version,
+                    SafeUpdateCandidate.model_version == model_version,
+                    SafeUpdateCandidate.config_version == config_version,
+                    SafeUpdateCandidate.eligible_on.is_not(None),
+                    SafeUpdateCandidate.eligible_on <= logical_day,
+                )
+                .order_by(
+                    SafeUpdateCandidate.eligible_on,
+                    SafeUpdateCandidate.candidate_day,
+                    SafeUpdateCandidate.id,
+                )
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        for candidate in candidates:
+            if not _quarantine_watermarks_complete(
+                session,
+                organization,
+                candidate,
+                policy,
+            ):
+                continue
+            reasons = _candidate_integrity_reasons(
+                session,
+                organization,
+                candidate,
+                latest_watermark_day=latest_watermark_day,
+                policy=policy,
+            )
+            candidate.decision_at = utc_now()
+            if reasons:
+                candidate.status = UpdateStatus.REJECTED
+                candidate.reason_codes = reasons
+                rejected += 1
+            else:
+                candidate.status = UpdateStatus.ACCEPTED
+                candidate.reason_codes = ["QUARANTINE_AND_WATERMARKS_PASSED"]
+                accepted += 1
+            append_audit(
+                session,
+                organization,
+                actor=actor,
+                action=f"safe_update.{candidate.status.value}",
+                entity_type="safe_update_candidate",
+                entity_id=str(candidate.id),
+                request_id=request_id,
+                after={
+                    "status": candidate.status.value,
+                    "reason_codes": candidate.reason_codes,
+                    "decision_at": candidate.decision_at,
+                    "policy_version": policy.policy_version,
+                },
+            )
+            session.flush()
+        session.flush()
+
+        if materialization_enabled:
+            accumulator_ids = list(
+                session.scalars(
+                    select(SafeUpdateCandidate.accumulator_id)
+                    .where(
+                        SafeUpdateCandidate.organization_id == organization.id,
+                        SafeUpdateCandidate.status == UpdateStatus.ACCEPTED,
+                        SafeUpdateCandidate.policy_version == policy.policy_version,
+                        SafeUpdateCandidate.model_version == model_version,
+                        SafeUpdateCandidate.config_version == config_version,
+                        SafeUpdateCandidate.accumulator_id.is_not(None),
+                    )
+                    .distinct()
+                )
+            )
+            for accumulator_id in sorted(accumulator_ids, key=str):
+                if accumulator_id is None:
+                    continue
+                applied += _materialize_accumulator(
+                    session,
+                    organization,
+                    accumulator_id,
+                    logical_day=logical_day,
+                    framework_config=framework_config,
+                    policy=policy,
+                    actor=actor,
+                    request_id=request_id,
+                )
+
+    rejected_after = int(
+        session.scalar(
+            select(func.count(SafeUpdateCandidate.id)).where(
+                SafeUpdateCandidate.organization_id == organization.id,
+                SafeUpdateCandidate.status == UpdateStatus.REJECTED,
+                SafeUpdateCandidate.policy_version == policy.policy_version,
+                SafeUpdateCandidate.model_version == model_version,
+                SafeUpdateCandidate.config_version == config_version,
+            )
+        )
+        or 0
+    )
+    rejected = max(rejected_after - rejected_before, 0)
+
+    pending = int(
+        session.scalar(
+            select(func.count(SafeUpdateCandidate.id)).where(
+                SafeUpdateCandidate.organization_id == organization.id,
+                SafeUpdateCandidate.status == UpdateStatus.CANDIDATE,
+                SafeUpdateCandidate.policy_version == policy.policy_version,
+                SafeUpdateCandidate.model_version == model_version,
+                SafeUpdateCandidate.config_version == config_version,
+            )
+        )
+        or 0
+    )
+    deferred = int(
+        session.scalar(
+            select(func.count(SafeUpdateCandidate.id)).where(
+                SafeUpdateCandidate.organization_id == organization.id,
+                SafeUpdateCandidate.status == UpdateStatus.ACCEPTED,
+                SafeUpdateCandidate.policy_version == policy.policy_version,
+                SafeUpdateCandidate.model_version == model_version,
+                SafeUpdateCandidate.config_version == config_version,
+            )
+        )
+        or 0
+    )
+    return {
+        "accepted": accepted,
+        "rejected": rejected,
+        "applied": applied,
+        "deferred": deferred,
+        "pending": pending,
+        "legacy_pending": legacy_pending,
+    }
 
 
 def framework_info() -> dict[str, Any]:

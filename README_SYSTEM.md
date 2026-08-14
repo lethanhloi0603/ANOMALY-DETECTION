@@ -165,6 +165,10 @@ machine_learning/
 | `cli.run_framework` | Smoke end-to-end có giới hạn trên dữ liệu CERT thật |
 | `cli.run_experiment` | Chạy toàn bộ pipeline đến Test metric |
 
+`cli.prepare_cert` mặc định giới hạn 25 user và luôn ghi `max_users` vào manifest. Artifact từ
+user shard chỉ dùng cho smoke/research; production reference yêu cầu nguồn không giới hạn user
+và pipeline SQLite đầy đủ.
+
 ### 3.2. Thư mục `backend/`
 
 Chứa lớp vận hành: FastAPI, persistence, alert workflow, audit và safe-update
@@ -191,7 +195,9 @@ backend/
 │  ├─ ingest_jsonl.py
 │  └─ export_universe.py
 ├─ config/
-│  └─ framework.v4.json
+│  ├─ framework.v4.json
+│  ├─ framework.v5.json
+│  └─ framework.v6.json
 ├─ migrations/
 ├─ tests/
 ├─ .env.example
@@ -210,11 +216,17 @@ backend/
 | `domain/readiness.py` | Chọn Person → Role → Global độc lập cho từng nhánh |
 | `domain/fusion.py` | Fusion calibrated Feature/Sequence score |
 | `domain/universe.py` | Universe employee-day theo role assignment có hiệu lực |
-| `framework.v4.json` | Rule trung tâm của framework |
+| `framework.v5.json` | Contract baseline của `experiment_v1`; giữ nguyên để tái lập kết quả cũ |
+| `framework.v6.json` | Contract nghiên cứu chính: readiness theo 124 feature đang bật và inactive day là `NO_SCORE` |
 
 Backend có thể lưu reference, nhận raw branch error, calibrate, fusion, áp dụng
 threshold đã khóa và tạo alert. `run_experiment` hiện xuất CSV/JSON phục vụ nghiên cứu;
 nó chưa tự động import kết quả vào backend database.
+
+`framework.v6` hiện là contract cho offline research pipeline và đặt
+`safe_personalized_update.production_enabled=false`. Backend runtime vẫn mặc định v5 cho đến
+khi có migration reference/database và rollout production riêng; không dùng v6 research config
+để bật production trực tiếp.
 
 ### 3.3. Thư mục `data/`
 
@@ -230,11 +242,13 @@ data/
 │  ├─ cert4.2_user_days.sqlite    full disk-backed store
 │  └─ smoke/                      store smoke
 ├─ artifacts/
-│  ├─ experiment_v1/              model/reference/prediction/metric full
+│  ├─ experiment_v1/              baseline framework.v5, không ghi đè
+│  ├─ experiment_v2/              primary framework.v6
 │  └─ smoke/                      artifact smoke
 ├─ evaluation/
 │  ├─ schema.sql
-│  └─ experiment_v1/              universe và label tách riêng
+│  ├─ experiment_v1/              universe và label baseline
+│  └─ experiment_v2/              universe và label primary v6
 └─ runtime/
    └─ insider_threat.db           database backend local
 ```
@@ -512,7 +526,8 @@ Hai phía dùng chung schema/rule version nhưng hiện không có job tự đ�
 của `run_experiment` vào backend.
 
 Safe personalized update bị loại khỏi primary experiment. Backend chỉ cho phép workflow
-này ở production, sau quarantine 7 ngày và không nhận ngày đã alert.
+này ở production, sau cửa sổ quarantine đóng `[D,D+30]`; ngày sớm nhất đủ điều
+kiện là `D+31`, với đầy đủ scoring watermark và không có alert trong cửa sổ.
 
 ## 12. Artifact, version và khả năng resume
 
@@ -539,7 +554,7 @@ Khi chạy lại:
 Chưa có:
 
 - Full `data/processed/cert4.2_user_days.sqlite`.
-- Full `data/artifacts/experiment_v1/experiment_report.json`.
+- Primary `data/artifacts/experiment_v2/experiment_report.json` với framework.v6.
 - Metric nghiên cứu thật trên toàn bộ CERT R4.2.
 - Job deployment tự động nối research artifact vào backend.
 

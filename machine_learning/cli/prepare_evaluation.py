@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
+from insider_ml.artifacts import atomic_write_csv
 from insider_ml.cert_data import CERT_TIME_FORMAT, LdapDirectory
 from insider_ml.contracts import (
     TEST_END,
@@ -101,19 +102,16 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         if (key[0], key[1].isoformat()) in universe_keys
     ]
     labels.sort(key=lambda row: (row["day"], row["user_id"]))
-    args.universe_out.parent.mkdir(parents=True, exist_ok=True)
-    with args.universe_out.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=("user_id", "day"))
-        writer.writeheader()
-        writer.writerows(universe_rows)
-    args.labels_out.parent.mkdir(parents=True, exist_ok=True)
-    with args.labels_out.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=("user_id", "day", "incident_id", "scenario", "is_positive"),
-        )
-        writer.writeheader()
-        writer.writerows(labels)
+    atomic_write_csv(
+        args.universe_out,
+        fieldnames=("user_id", "day"),
+        rows=universe_rows,
+    )
+    atomic_write_csv(
+        args.labels_out,
+        fieldnames=("user_id", "day", "incident_id", "scenario", "is_positive"),
+        rows=labels,
+    )
     return {
         "schema_version": "cert-evaluation-materialization.v1",
         "split": args.split,

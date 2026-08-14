@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from datetime import date, datetime
 from enum import StrEnum
@@ -421,6 +422,13 @@ class ReferenceProfileRead(ORMModel):
     frozen: bool
     support_json: dict[str, Any]
     statistics_json: dict[str, Any]
+    parent_reference_profile_id: str | None
+    calibration_parent_profile_id: str | None
+    reference_version: int | None
+    release_kind: str | None
+    release_day: date | None
+    release_influence_ratio: float | None
+    policy_version: str
     checksum: str
     created_at: datetime
 
@@ -439,11 +447,31 @@ class BranchAssessmentInput(StrictModel):
             raise ValueError("raw_score must be finite")
         return value
 
+    @model_validator(mode="after")
+    def evidence_is_bounded(self) -> BranchAssessmentInput:
+        encoded = json.dumps(
+            self.evidence,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > 65_536:
+            raise ValueError("branch evidence must not exceed 64 KiB")
+        for field_name in ("top_features", "top_transitions"):
+            values = self.evidence.get(field_name)
+            if values is None:
+                continue
+            if not isinstance(values, list) or len(values) > 20 or any(
+                not isinstance(value, str) or not value.strip() for value in values
+            ):
+                raise ValueError(f"{field_name} must contain at most 20 non-empty strings")
+        return self
+
 class AssessmentCreate(StrictModel):
     user_id: str = Field(min_length=1, max_length=128)
     day: date
     model_version: str = Field(min_length=1, max_length=128)
-    config_version: str = Field(default="framework.v4", min_length=1, max_length=128)
+    config_version: str = Field(min_length=1, max_length=128)
     split: str = Field(pattern=r"^(TRAIN|VALIDATION|TEST|PRODUCTION)$")
     feature: BranchAssessmentInput | None = None
     sequence: BranchAssessmentInput | None = None
@@ -542,20 +570,48 @@ class SafeUpdateRead(ORMModel):
     branch: str
     status: str
     quarantine_until: date
+    eligible_on: date | None
+    admission_percentile: float | None
+    admission_threshold: float | None
+    policy_version: str
+    materialized_reference_profile_id: str | None
+    reference_release_id: str | None
     decision_reasons_json: list[str]
     decided_at: datetime | None
     created_at: datetime
 
 
 class SafeUpdateProcessRequest(StrictModel):
-    through_date: date
+    model_version: str = Field(min_length=1, max_length=128)
+    config_version: str = Field(min_length=1, max_length=128)
     limit: int = Field(default=1000, ge=1, le=10000)
 
 
 class SafeUpdateProcessResult(BaseModel):
     accepted: int
     rejected: int
+    applied: int
+    deferred: int
     pending: int
+    legacy_pending: int
+
+
+class ScoringWatermarkCloseRequest(StrictModel):
+    day: date
+    model_version: str = Field(min_length=1, max_length=128)
+    config_version: str = Field(min_length=1, max_length=128)
+
+
+class ScoringWatermarkRead(ORMModel):
+    id: str
+    day: date
+    model_version: str
+    config_version: str
+    expected_assessments: int
+    persisted_assessments: int
+    universe_checksum: str
+    assessment_set_checksum: str
+    completed_at: datetime
 
 
 class FrameworkInfo(BaseModel):

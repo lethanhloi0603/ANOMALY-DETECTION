@@ -20,6 +20,7 @@ data/runtime/**/*
 !data/runtime/**/.gitkeep
 data/evaluation/labels/**/*
 !data/evaluation/labels/.gitkeep
+data/evaluation/experiment_*/**/*
 .docx_render/
 
 *.db

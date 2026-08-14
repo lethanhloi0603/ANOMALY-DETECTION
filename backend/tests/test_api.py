@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
 from collections.abc import Iterator
@@ -37,6 +37,7 @@ def configured_client(**setting_overrides: Any) -> Iterator[TestClient]:
         "api_key_actor": "test-api-principal",
         "scorer_api_key": None,
         "scorer_api_key_actor": "test-scorer-principal",
+        "safe_update_materialization_enabled": False,
         "locked_alert_threshold": 0.95,
         "cors_origins": (),
     }
@@ -111,6 +112,9 @@ def test_health_framework_and_openapi(client: TestClient) -> None:
     assert config["primary_evaluation"]["all_reference_levels_train_only"] is True
     assert config["primary_evaluation"]["client_supplied_support_allowed"] is False
     assert config["safe_personalized_update"]["primary_evaluation_enabled"] is False
+    assert config["safe_personalized_update"]["release"][
+        "materialization_enabled"
+    ] is False
     assert config["evaluation_universe"]["include_inactive_days"] is True
     assert config["timestamp_policy"]["cert_basis"] == "LOCAL_WALL_CLOCK"
     assert config["window_policy"]["range"] == "[D-29,D]"
@@ -132,6 +136,7 @@ def test_production_requires_general_and_scorer_api_keys(client: TestClient) -> 
                 api_key=None,
                 scorer_api_key="scorer-secret",
                 locked_alert_threshold=0.95,
+                safe_update_materialization_enabled=False,
             ),
             database_engine=engine,
         )
@@ -143,6 +148,7 @@ def test_production_requires_general_and_scorer_api_keys(client: TestClient) -> 
                 api_key="general-secret",
                 scorer_api_key=None,
                 locked_alert_threshold=0.95,
+                safe_update_materialization_enabled=False,
             ),
             database_engine=engine,
         )
@@ -154,6 +160,7 @@ def test_production_requires_general_and_scorer_api_keys(client: TestClient) -> 
                 api_key="shared-secret",
                 scorer_api_key="shared-secret",
                 locked_alert_threshold=0.95,
+                safe_update_materialization_enabled=False,
             ),
             database_engine=engine,
         )
@@ -166,6 +173,21 @@ def test_production_requires_general_and_scorer_api_keys(client: TestClient) -> 
                 api_key="general-secret",
                 scorer_api_key="scorer-secret",
                 locked_alert_threshold=None,
+                safe_update_materialization_enabled=False,
+            ),
+            database_engine=engine,
+        )
+
+    with pytest.raises(RuntimeError, match="requires a PostgreSQL DATABASE_URL"):
+        create_app(
+            replace(
+                settings,
+                app_env="production",
+                database_url="sqlite+pysqlite:///:memory:",
+                api_key="general-secret",
+                scorer_api_key="scorer-secret",
+                locked_alert_threshold=0.95,
+                safe_update_materialization_enabled=True,
             ),
             database_engine=engine,
         )
@@ -194,7 +216,7 @@ def test_authenticated_principals_ignore_spoofed_actor_header() -> None:
             "user_id": "U001",
             "day": "2010-06-01",
             "model_version": "auth.v1",
-            "config_version": "framework.v4",
+            "config_version": "framework.v5",
             "split": "VALIDATION",
         }
         denied = secured.post(
@@ -204,6 +226,29 @@ def test_authenticated_principals_ignore_spoofed_actor_header() -> None:
         )
         assert denied.status_code == 401
         assert denied.json()["code"] == "SCORER_UNAUTHORIZED"
+
+        denied_process = secured.post(
+            "/api/v1/safe-updates/process",
+            json={
+                "model_version": "auth.v1",
+                "config_version": "framework.v5",
+            },
+            headers=general_headers,
+        )
+        assert denied_process.status_code == 401
+        assert denied_process.json()["code"] == "SCORER_UNAUTHORIZED"
+
+        denied_watermark = secured.post(
+            "/api/v1/scoring-watermarks/close-day",
+            json={
+                "day": "2011-05-18",
+                "model_version": "auth.v1",
+                "config_version": "framework.v5",
+            },
+            headers=general_headers,
+        )
+        assert denied_watermark.status_code == 401
+        assert denied_watermark.json()["code"] == "SCORER_UNAUTHORIZED"
 
         scored = secured.post(
             "/api/v1/assessments/score",
@@ -264,6 +309,47 @@ def test_request_body_limit_applies_without_content_length() -> None:
         )
     assert response.status_code == 413, response.text
     assert response.json()["code"] == "REQUEST_TOO_LARGE"
+
+
+def test_request_id_rejects_unsafe_or_oversized_values(client: TestClient) -> None:
+    unsafe = client.get("/health/live", headers={"x-request-id": "bad request id"})
+    assert unsafe.status_code == 400
+    assert unsafe.json()["code"] == "INVALID_REQUEST_ID"
+
+    oversized = client.get("/health/live", headers={"x-request-id": "x" * 161})
+    assert oversized.status_code == 400
+    assert oversized.json()["code"] == "INVALID_REQUEST_ID"
+
+    accepted = client.get("/health/live", headers={"x-request-id": "run:2026-08-03_01"})
+    assert accepted.status_code == 200
+    assert accepted.headers["x-request-id"] == "run:2026-08-03_01"
+
+
+def test_runtime_event_batch_limit_is_enforced() -> None:
+    with configured_client(max_batch_events=1) as limited:
+        create_identity(limited)
+        event = {
+            "event_uid": "file:batch-1",
+            "source": "FILE",
+            "original_id": "batch-1",
+            "timestamp": "2010-06-01T09:00:00+00:00",
+            "user_id": "U001",
+            "pc": "PC-1",
+            "action": "FILE_COPY",
+            "object": "report.pdf",
+            "source_payload": {"filename": "report.pdf"},
+        }
+        response = limited.post(
+            "/api/v1/events/batch",
+            json={
+                "events": [
+                    event,
+                    {**event, "event_uid": "file:batch-2", "original_id": "batch-2"},
+                ]
+            },
+        )
+    assert response.status_code == 413
+    assert response.json()["code"] == "EVENT_BATCH_TOO_LARGE"
 
 
 def test_event_ingestion_is_idempotent_and_blocks_labels(client: TestClient) -> None:
@@ -680,6 +766,7 @@ def create_reference(
     frozen: bool = True,
     as_of_date: str = "2010-06-01",
     fitted_through: str = "2010-05-31",
+    config_version: str = "framework.v5",
 ) -> str:
     response = client.post(
         "/api/v1/references",
@@ -689,18 +776,19 @@ def create_reference(
             "scope_key": scope_key,
             "as_of_date": as_of_date,
             "model_version": "baseline.v1",
-            "config_version": "framework.v4",
+            "config_version": config_version,
             "version": f"{branch.lower()}-{level.lower()}-{checksum_char}.v1",
             "fitted_through": fitted_through,
             "frozen": frozen,
             "support": {
                 **(
                     {
-                        "active_days": 40,
-                        "span_days": 60,
-                        "active_days_current_role": 40,
+                        "active_days": 60,
+                        "span_days": 90,
+                        "active_days_current_role": 60,
                         "coverage": 1.0,
-                        "min_feature_observations": 30,
+                        "min_feature_observations": 60,
+                        "feature_observation_counts": [60] * 128,
                         "last_active_gap_days": 1,
                     }
                     if branch == "FEATURE" and level == "PERSON"
@@ -708,10 +796,10 @@ def create_reference(
                 ),
                 **(
                     {
-                        "sequence_days": 25,
-                        "transitions": 600,
-                        "span_days": 40,
-                        "sequence_days_current_role": 25,
+                        "sequence_days": 60,
+                        "transitions": 1_500,
+                        "span_days": 90,
+                        "sequence_days_current_role": 60,
                         "last_active_gap_days": 1,
                     }
                     if branch == "SEQUENCE" and level == "PERSON"
@@ -739,7 +827,35 @@ def create_reference(
         },
     )
     assert response.status_code == 201, response.text
+    assert response.json()["parent_reference_profile_id"] is None
+    assert response.json()["calibration_parent_profile_id"] is None
+    assert response.json()["reference_version"] is None
+    assert response.json()["release_kind"] == (
+        "LEGACY" if config_version == "framework.v4" else None
+    )
+    assert response.json()["policy_version"] == config_version
     return response.json()["id"]
+
+
+def test_framework_v4_reference_is_explicitly_exposed_as_legacy(
+    client: TestClient,
+) -> None:
+    create_identity(client)
+    profile_id = create_reference(
+        client,
+        branch="FEATURE",
+        level="GLOBAL",
+        scope_key="global",
+        checksum_char="9",
+        support={"user_days": 200},
+        config_version="framework.v4",
+    )
+
+    response = client.get(f"/api/v1/references/{profile_id}")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["release_kind"] == "LEGACY"
+    assert response.json()["policy_version"] == "framework.v4"
 
 
 def test_all_evaluation_reference_levels_are_frozen_train_only(
@@ -752,7 +868,10 @@ def test_all_evaluation_reference_levels_are_frozen_train_only(
         level="PERSON",
         scope_key="user:U001",
         checksum_char="d",
-        support={},
+        support={
+            "observations": 120,
+            "feature_observation_counts": [100] * 128,
+        },
         frozen=False,
     )
     rejected_mutable = client.post(
@@ -761,7 +880,7 @@ def test_all_evaluation_reference_levels_are_frozen_train_only(
             "user_id": "U001",
             "day": "2010-06-01",
             "model_version": "baseline.v1",
-            "config_version": "framework.v4",
+            "config_version": "framework.v5",
             "split": "VALIDATION",
             "feature": {
                 "raw_score": 1.0,
@@ -788,7 +907,7 @@ def test_all_evaluation_reference_levels_are_frozen_train_only(
             "user_id": "U001",
             "day": "2010-06-02",
             "model_version": "baseline.v1",
-            "config_version": "framework.v4",
+            "config_version": "framework.v5",
             "split": "VALIDATION",
             "feature": {
                 "raw_score": 1.0,
@@ -810,7 +929,7 @@ def test_independent_backoff_fusion_alert_and_frozen_evaluation_update(
         level="PERSON",
         scope_key="user:U001",
         checksum_char="a",
-        support={"active_days": 40, "coverage": 1.0},
+        support={"active_days": 60, "coverage": 1.0},
     )
     sequence_person = create_reference(
         client,
@@ -835,7 +954,7 @@ def test_independent_backoff_fusion_alert_and_frozen_evaluation_update(
             "user_id": "U001",
             "day": "2010-06-01",
             "model_version": "baseline.v1",
-            "config_version": "framework.v4",
+            "config_version": "framework.v5",
             "split": "VALIDATION",
             "feature": {
                 "raw_score": 2.4,
@@ -865,28 +984,38 @@ def test_independent_backoff_fusion_alert_and_frozen_evaluation_update(
         "/api/v1/assessments/U001/2010-06-01",
         params={
             "model_version": "baseline.v1",
-            "config_version": "framework.v4",
+            "config_version": "framework.v5",
         },
     )
     assert detail.status_code == 200, detail.text
     body = detail.json()
     assert body["feature"]["selected_level"] == "PERSON"
     assert body["sequence"]["selected_level"] == "ROLE"
-    assert "SP_TRANS_LT_500" in body["sequence"]["fallback_reasons_json"]
+    assert "SP_TRANSITIONS_LOW" in body["sequence"]["fallback_reasons_json"]
     assert body["alert"]["status"] == "OPEN"
     assert body["safe_updates"] == []
 
     processed = client.post(
         "/api/v1/safe-updates/process",
-        json={"through_date": "2010-06-08"},
+        json={
+            "model_version": "baseline.v1",
+            "config_version": "framework.v5",
+        },
     )
     assert processed.status_code == 200, processed.text
-    assert processed.json() == {"accepted": 0, "rejected": 0, "pending": 0}
+    assert processed.json() == {
+        "accepted": 0,
+        "rejected": 0,
+        "applied": 0,
+        "deferred": 0,
+        "pending": 0,
+        "legacy_pending": 0,
+    }
     detail = client.get(
         "/api/v1/assessments/U001/2010-06-01",
         params={
             "model_version": "baseline.v1",
-            "config_version": "framework.v4",
+            "config_version": "framework.v5",
         },
     )
     assert detail.json()["safe_updates"] == []
@@ -921,6 +1050,7 @@ def test_both_branches_missing_produces_no_score_and_no_alert(
             "user_id": "U001",
             "day": "2010-06-01",
             "model_version": "empty.v1",
+            "config_version": "framework.v5",
             "split": "VALIDATION",
         },
     )
@@ -931,6 +1061,75 @@ def test_both_branches_missing_produces_no_score_and_no_alert(
     assert body["threshold"] is None
     assert body["is_alert"] is False
     assert client.get("/api/v1/alerts").json() == []
+
+
+def test_scoring_watermark_is_complete_idempotent_and_final(client: TestClient) -> None:
+    create_identity(client)
+    watermark_payload = {
+        "day": "2011-05-18",
+        "model_version": "watermark.v1",
+        "config_version": "framework.v5",
+    }
+    incomplete = client.post(
+        "/api/v1/scoring-watermarks/close-day",
+        json=watermark_payload,
+    )
+    assert incomplete.status_code == 422, incomplete.text
+    assert incomplete.json()["code"] == "SCORING_DAY_INCOMPLETE"
+
+    scored = client.post(
+        "/api/v1/assessments/score",
+        json={
+            "user_id": "U001",
+            "day": "2011-05-18",
+            "model_version": "watermark.v1",
+            "config_version": "framework.v5",
+            "split": "PRODUCTION",
+        },
+    )
+    assert scored.status_code == 201, scored.text
+    assert scored.json()["state"] == "NO_SCORE"
+
+    closed = client.post(
+        "/api/v1/scoring-watermarks/close-day",
+        json=watermark_payload,
+    )
+    assert closed.status_code == 201, closed.text
+    repeated = client.post(
+        "/api/v1/scoring-watermarks/close-day",
+        json=watermark_payload,
+    )
+    assert repeated.status_code == 201, repeated.text
+    assert repeated.json()["id"] == closed.json()["id"]
+
+    second_user = client.post(
+        "/api/v1/users",
+        json={"user_id": "U002", "display_name": "Bob"},
+    )
+    assert second_user.status_code == 201, second_user.text
+    late_assessment = client.post(
+        "/api/v1/assessments/score",
+        json={
+            "user_id": "U002",
+            "day": "2011-05-18",
+            "model_version": "watermark.v1",
+            "config_version": "framework.v5",
+            "split": "PRODUCTION",
+        },
+    )
+    assert late_assessment.status_code == 409, late_assessment.text
+    assert late_assessment.json()["code"] == "SCORING_DAY_ALREADY_CLOSED"
+
+    late_assignment = client.post(
+        "/api/v1/users/U002/role-assignments",
+        json={
+            "role_code": "ENGINEER",
+            "valid_from": "2011-05-18",
+            "source_snapshot_date": "2011-05-17",
+        },
+    )
+    assert late_assignment.status_code == 409, late_assignment.text
+    assert late_assignment.json()["code"] == "ROLE_TIMELINE_DAY_ALREADY_CLOSED"
 
 
 def test_assessment_lookup_requires_and_filters_config_version(
@@ -945,7 +1144,7 @@ def test_assessment_lookup_requires_and_filters_config_version(
     }
     response = client.post(
         "/api/v1/assessments/score",
-        json={**base_payload, "config_version": "framework.v4"},
+        json={**base_payload, "config_version": "framework.v5"},
     )
     assert response.status_code == 201, response.text
 
@@ -959,11 +1158,11 @@ def test_assessment_lookup_requires_and_filters_config_version(
         "/api/v1/assessments/U001/2010-06-01",
         params={
             "model_version": "same-model.v1",
-            "config_version": "framework.v4",
+            "config_version": "framework.v5",
         },
     )
     assert selected.status_code == 200, selected.text
-    assert selected.json()["assessment"]["config_version"] == "framework.v4"
+    assert selected.json()["assessment"]["config_version"] == "framework.v5"
 
     absent = client.get(
         "/api/v1/assessments/U001/2010-06-01",
@@ -1065,7 +1264,7 @@ def test_scoring_release_is_idempotent_and_uses_server_config(
         "user_id": "U001",
         "day": "2010-06-01",
         "model_version": "idempotent.v1",
-        "config_version": "framework.v4",
+        "config_version": "framework.v5",
         "split": "VALIDATION",
     }
     first = client.post("/api/v1/assessments/score", json=payload)

@@ -315,6 +315,10 @@ fingerprint hợp lệ sẽ được bỏ qua.
 
 ## 11. Chạy full experiment trên máy RAM 8 GB
 
+CLI hiện mặc định dùng `backend/config/framework.v6.json` và ghi vào `experiment_v2`.
+Không xóa hoặc ghi đè `experiment_v1`; đó là baseline framework.v5. Khi full SQLite store đã
+hoàn tất, dùng `--skip-store-build` để tái sử dụng store nhưng vẫn train checkpoint v2 mới.
+
 Trước khi chạy:
 
 1. Khởi động lại Windows.
@@ -330,6 +334,7 @@ Lần đầu chạy không bootstrap để sớm có metric:
 Set-Location "C:\Users\<USER>\Downloads\Insider threat\machine_learning"
 
 ..\.venv\Scripts\python.exe -m cli.run_experiment `
+  --skip-store-build `
   --batch-size 2 `
   --epochs 20 `
   --bootstrap 0 `
@@ -363,6 +368,7 @@ Sau khi full run `bootstrap=0` hoàn thành, chạy lại:
 Set-Location "C:\Users\<USER>\Downloads\Insider threat\machine_learning"
 
 ..\.venv\Scripts\python.exe -m cli.run_experiment `
+  --skip-store-build `
   --batch-size 2 `
   --epochs 20 `
   --bootstrap 1000 `
@@ -377,7 +383,7 @@ lệ sẽ được tái sử dụng; evaluator sẽ tính thêm confidence inter
 Thư mục chính:
 
 ```text
-data/artifacts/experiment_v1/
+data/artifacts/experiment_v2/
 ```
 
 Các file quan trọng:
@@ -397,7 +403,7 @@ Các file quan trọng:
 Universe và label được đặt riêng tại:
 
 ```text
-data/evaluation/experiment_v1/
+data/evaluation/experiment_v2/
 ```
 
 ## 14. Resume khi máy bị dừng
@@ -406,6 +412,7 @@ Chạy lại đúng lệnh full:
 
 ```powershell
 ..\.venv\Scripts\python.exe -m cli.run_experiment `
+  --skip-store-build `
   --batch-size 2 `
   --epochs 20 `
   --bootstrap 0 `
@@ -438,7 +445,7 @@ Kiểm tra artifact đang được cập nhật:
 ```powershell
 Get-ChildItem `
   "C:\Users\<USER>\Downloads\Insider threat\data\processed", `
-  "C:\Users\<USER>\Downloads\Insider threat\data\artifacts\experiment_v1" `
+  "C:\Users\<USER>\Downloads\Insider threat\data\artifacts\experiment_v2" `
   -Recurse -File -ErrorAction SilentlyContinue |
   Sort-Object LastWriteTime -Descending |
   Select-Object -First 15 FullName, Length, LastWriteTime
@@ -513,7 +520,7 @@ Store/checkpoint đã hoàn thành vẫn có thể resume.
 
 ```text
 data/processed/cert4.2_user_days.sqlite.manifest.json
-data/artifacts/experiment_v1/references.train.json
+data/artifacts/experiment_v2/references.train.json
 ```
 
 Kiểm tra support Global Feature/Sequence. Pipeline cố ý dừng thay vì tạo metric trên
@@ -540,7 +547,7 @@ Nếu đã chạy Validation, nạp đúng locked threshold từ báo cáo:
 
 ```powershell
 $validationReport = Get-Content -Raw `
-  "..\data\artifacts\experiment_v1\validation.metrics.json" |
+  "..\data\artifacts\experiment_v2\validation.metrics.json" |
   ConvertFrom-Json
 
 $env:LOCKED_ALERT_THRESHOLD = [string]$validationReport.threshold
@@ -575,7 +582,7 @@ Tại thư mục gốc:
 
 ```powershell
 $validationReport = Get-Content -Raw `
-  ".\data\artifacts\experiment_v1\validation.metrics.json" |
+  ".\data\artifacts\experiment_v2\validation.metrics.json" |
   ConvertFrom-Json
 
 $env:API_KEY = "replace-with-a-long-secret"

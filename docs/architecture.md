@@ -40,7 +40,7 @@ Tài liệu này không đặc tả endpoint, HTTP method hoặc hợp đồng A
 | Domain | Readiness, fusion và các bất biến pure-Python | Dataclass, config versioned, reason code | ORM/session hoặc phụ thuộc transport |
 | Artifact storage | Partition lớn, model artifact, manifest, checksum | Canonical/feature/sequence/model export | Dữ liệu chưa hoàn tất được đánh dấu READY |
 | Evaluation plane | Join decision bất biến với label, tính metric và CI | Label, incident, scenario, evaluation run | Credential được cấp cho API/ingestion/scorer |
-| Configuration/catalog | Khóa feature, token, split, policy threshold và version | `feature128.v5`, `sequence7.v4`, `framework.v4` | Thay đổi âm thầm trong cùng version |
+| Configuration/catalog | Khóa feature, token, split, policy threshold và version | `feature128.v5`, `sequence7.v4`, `framework.v6` (`v5` baseline) | Thay đổi âm thầm trong cùng version |
 
 Business rule phải nằm ở domain hoặc validation layer. Transport chỉ gọi và chuyển kết quả;
 persistence chỉ bảo vệ tính toàn vẹn, quan hệ và lịch sử.
@@ -290,24 +290,29 @@ Quan hệ và uniqueness quan trọng:
   fitted-through.
 - RiskAssessment tham chiếu tối đa một Feature score và một Sequence score.
 - Mỗi assessment chỉ mở tối đa một alert.
-- Score, assessment và audit record là immutable; alert là workflow record mutable.
+- Reference profile, branch score, assessment, scoring watermark, reference release và audit
+  record là immutable; alert và active Personal pointer là workflow state mutable có audit.
 
 ## 6. Bất biến readiness
 
 ### 6.1 Feature branch
 
-Các threshold mặc định nằm trong `backend/config/framework.v4.json`:
+Primary experiment mới dùng `backend/config/framework.v6.json`. `framework.v5` được giữ
+nguyên để tái lập baseline `experiment_v1`:
 
-- Person: ít nhất 30 active days, span 45 ngày, 30 active days trong role hiện tại, coverage
-  90%, 20 quan sát cho mỗi feature dùng và stale gap không quá 30 ngày.
+- Person: ít nhất 60 active days, span 90 ngày, 60 active days trong role hiện tại; ít nhất
+  90% trong 124 primary-enabled features phải có 40 quan sát; stale gap không quá 30 ngày.
 - Role: role known, ít nhất 15 peer user khác subject, 300 peer user-days, 100 user-days gần
-  nhất, coverage 90% và 200 support cho mỗi feature.
-- Global: ít nhất 200 user, 10.000 user-days, coverage 90%, fit Train-only.
+  nhất; ít nhất 90% enabled features phải có 200 support.
+- Global: ít nhất 200 user, 10.000 user-days; ít nhất 90% enabled features phải có 200
+  support; fit Train-only.
+- X12–X15 bị tắt trong primary experiment nên không nằm trong mẫu số readiness. Inactive
+  employee-day vẫn nằm trong evaluation universe nhưng nhận `NO_SCORE` và không alert.
 
 ### 6.2 Sequence branch
 
 - Current day: `seq_len < 2` trả ngay `S_CURRENT_LEN_LT_2` và `NO_SCORE`.
-- Person: ít nhất 20 sequence-days, 500 transitions, span 30 ngày, 20 sequence-days trong role
+- Person: ít nhất 60 sequence-days, 1.500 transitions, span 90 ngày, 60 sequence-days trong role
   hiện tại và stale gap không quá 30 ngày.
 - Role: role known, ít nhất 15 peer user, 300 sequence-days, 10.000 transitions và 2.000
   transitions trong 30 ngày gần nhất.
@@ -351,7 +356,8 @@ cho `PRODUCTION` và phải được báo cáo như thí nghiệm online riêng.
 1. **Score-first**: ngày D chưa nằm trong personal profile.
 2. **Candidate**: tạo `SafeUpdateCandidate` gắn với assessment, branch, role assignment và
    reference profile.
-3. **Quarantine**: chờ mặc định 7 ngày; `quarantine_until` không được trước candidate day.
+3. **Quarantine**: kiểm tra cửa sổ đóng `[D,D+30]`; `quarantine_until=D+30` và
+   ngày đủ điều kiện sớm nhất là `eligible_on=D+31`.
 4. **Reject**: không update nếu ngày D hoặc bất kỳ ngày nào trong cửa sổ quarantine có alert,
    hoặc role epoch đã thay đổi.
 5. **Accept**: sau quarantine và không có điều kiện reject, tạo candidate được chấp nhận để
@@ -484,11 +490,14 @@ checkpoint sau từng epoch. Full experiment từ chối source có row cap, sto
 `2011-05-17`, split thiếu hoặc không có branch global nào đạt readiness.
 - Sequence: `sequence7.v4`, 7 token khách quan, `max_len=256`, head-tail `128+128`.
 - Model: `tcn-transformer-ae.v4`, cửa sổ past-only đúng `[D-29,D]`.
-- Framework config: `framework.v4`.
+- Framework config primary: `framework.v6`; `framework.v5` là baseline tái lập.
 - Train: `2010-01-02` đến `2010-05-31`.
 - Validation: `2010-06-01` đến `2010-09-30`.
 - Test: `2010-10-01` đến `2011-05-17`.
-- Safe-update quarantine: 7 ngày.
+- Safe-update quarantine: cửa sổ đóng `[D,D+30]`, sớm nhất áp dụng ở `D+31`.
+- Safe-update admission: percentile trên ROLE/GLOBAL parent phải nhỏ hơn `0.90`.
+- Incremental Personal release: tối đa `2%` mỗi 7 ngày và `10%` trong cửa sổ 30 ngày;
+  bootstrap dùng support Feature/Sequence 60 ngày và tạo immutable reference version mới.
 
 Mọi thay đổi feature, token, preprocessing, threshold, fusion weight, split hoặc role mapping
 phải tăng version phù hợp. Branch score và assessment phải lưu ít nhất
@@ -512,14 +521,13 @@ Các mục sau chưa có đủ specification để xem là hợp đồng product
 - Cách định nghĩa timezone/ràng buộc lịch làm việc nếu triển khai ngoài CERT; primary CERT
   không có fixed work-hours.
 - Công thức và cửa sổ chính xác cho `multi_channel_burst_count`; bốn chain X12-X15 đã bị bỏ.
-- Tiêu chí support nào được backend tự materialize từ core thay vì nhận snapshot từ scorer.
+- ROLE/GLOBAL support vẫn là artifact do scorer phát hành; riêng Personal safe-update được backend
+  materialize từ candidate đã admission, quarantine và kiểm tra watermark đầy đủ.
 - Kiến trúc model đã khóa là TCN–Transformer Autoencoder; còn phải chốt tiêu chí promotion,
   rollback và ngưỡng chấp nhận theo từng release.
 - Alert budget, threshold production, severity bands và quy trình đổi threshold.
-- Định nghĩa “chuỗi alert liên tiếp”, percentile 95 dùng cho safe-update reject và influence
-  cap cụ thể.
-- Cách materialize personal profile sau accept: update in-place hay tạo immutable profile
-  version mới. Hướng ưu tiên là version mới có before/after checksum.
+- Định nghĩa “chuỗi alert liên tiếp” và chính sách xử lý một alert phát hiện sau khi Personal
+  release đã được materialize.
 - Retention, encryption key management, data residency, backup/restore và disaster recovery.
 - Cơ chế xác thực/ủy quyền production, RLS, service account và analyst permission model.
 - Chiến lược PostgreSQL partition/index, object storage backend, worker queue và lịch compaction.

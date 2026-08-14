@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from insider_ml.artifacts import atomic_write_json
 from insider_ml.evaluation.metrics import (
     EvaluationInputError,
     evaluate,
@@ -146,13 +147,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parse_args(argv)
         result = run(args)
-        rendered = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
         if args.output:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(rendered + "\n", encoding="utf-8")
+            atomic_write_json(args.output, result)
             print(f"metrics written to {args.output}")
         else:
-            print(rendered)
+            print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     except (EvaluationInputError, OSError) as exc:
         print(f"evaluation failed: {exc}", file=sys.stderr)

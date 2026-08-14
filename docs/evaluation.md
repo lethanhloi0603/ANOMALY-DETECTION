@@ -196,7 +196,7 @@ Core và label database vẫn được mở riêng; evaluator không attach ho�
   --core-sqlite ..\data\runtime\insider_threat.db `
   --organization default `
   --model-version baseline.v1 `
-  --config-version framework.v4 `
+  --config-version framework.v5 `
   --labels-sqlite D:\isolated-evaluation\labels.db `
   --positive-only-answer-key `
   --universe-csv ..\data\evaluation\validation_universe.csv `

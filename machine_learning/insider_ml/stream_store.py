@@ -25,6 +25,7 @@ from urllib.parse import parse_qsl, urlsplit
 import numpy as np
 import pyarrow.csv as arrow_csv
 
+from insider_ml.artifacts import atomic_write_json
 from insider_ml.cert_data import (
     CALENDAR_IDS,
     CERT_TIME_FORMAT,
@@ -715,6 +716,10 @@ class RollingTemporalReference:
     def frozen_copy(self) -> RollingTemporalReference:
         result = RollingTemporalReference()
         result.histogram = self.histogram.copy()
+        result.entries = deque(
+            (day, user_id, histogram.copy())
+            for day, user_id, histogram in self.entries
+        )
         result.users = self.users.copy()
         return result
 
@@ -2103,9 +2108,6 @@ def build_stream_store(
         connection.close()
     manifest["store_size_bytes"] = store_path.stat().st_size
     manifest_path = store_path.with_suffix(store_path.suffix + ".manifest.json")
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(manifest_path, manifest)
     manifest["manifest"] = str(manifest_path.resolve())
     return manifest

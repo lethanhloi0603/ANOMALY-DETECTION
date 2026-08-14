@@ -21,3 +21,7 @@ Pipeline feature/sequence chỉ được đọc các nguồn hành vi như `logo
 trong ablation có schema và artifact tách riêng, không thuộc primary experiment.
 `answers/` cùng `insiders.csv` là ground truth phục vụ evaluation, tuyệt đối
 không được đưa vào preprocessing, train, reference hoặc model input.
+
+`artifacts/experiment_v1` và `evaluation/experiment_v1` là baseline `framework.v5` và
+không được ghi đè. Primary rerun theo Option 2 ghi vào `experiment_v2` với
+`backend/config/framework.v6.json`; SQLite store trong `processed/` được tái sử dụng.

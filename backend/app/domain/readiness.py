@@ -4,7 +4,7 @@ The framework scores one ``(user_id, score_date)`` at a time.  Feature and
 sequence readiness are deliberately evaluated independently.  Every support
 snapshot must be strictly historical: ``support_as_of < score_date``.
 
-Configuration is loaded lazily from ``config/framework.v4.json`` so importing
+Configuration is loaded lazily from the configured versioned framework file so importing
 this module remains safe while a deployment is being bootstrapped.  If the
 file does not exist, the versioned framework defaults below are used.  A
 present but malformed file is an error; silently ignoring bad configuration
@@ -22,18 +22,20 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "framework.v4.json"
+from app.settings import settings
+
+DEFAULT_CONFIG_PATH = settings.framework_config_path
 
 DEFAULT_FRAMEWORK_CONFIG: dict[str, Any] = {
-    "version": "framework.v4",
+    "version": "framework.v5",
     "readiness": {
         "feature": {
             "person": {
-                "min_active_days": 30,
-                "min_span_days": 45,
-                "min_role_active_days": 30,
+                "min_active_days": 60,
+                "min_span_days": 90,
+                "min_role_active_days": 60,
                 "min_coverage": 0.90,
-                "min_feature_observations": 20,
+                "min_feature_observations": 40,
                 "max_last_active_gap_days": 30,
             },
             "role": {
@@ -53,10 +55,10 @@ DEFAULT_FRAMEWORK_CONFIG: dict[str, Any] = {
         "sequence": {
             "current_day": {"min_seq_len": 2},
             "person": {
-                "min_sequence_days": 20,
-                "min_transitions": 500,
-                "min_span_days": 30,
-                "min_role_sequence_days": 20,
+                "min_sequence_days": 60,
+                "min_transitions": 1_500,
+                "min_span_days": 90,
+                "min_role_sequence_days": 60,
                 "max_last_active_gap_days": 30,
             },
             "role": {
@@ -409,15 +411,15 @@ def select_feature_reference(
         if not _support_is_past(person.support_as_of, day):
             person_reasons.append("P_SUPPORT_NOT_PAST")
         if person.active_days < cfg["min_active_days"]:
-            person_reasons.append("P_ACTIVE_DAYS_LT_30")
+            person_reasons.append("P_ACTIVE_DAYS_LOW")
         if person.span_days < cfg["min_span_days"]:
-            person_reasons.append("P_SPAN_LT_45")
+            person_reasons.append("P_SPAN_DAYS_LOW")
         if person.active_days_current_role < cfg["min_role_active_days"]:
-            person_reasons.append("P_ROLE_TENURE_LT_30")
+            person_reasons.append("P_ROLE_TENURE_LOW")
         if person.coverage < cfg["min_coverage"]:
             person_reasons.append("P_COVERAGE_LOW")
         if person.min_feature_observations < cfg["min_feature_observations"]:
-            person_reasons.append("P_FEATURE_SUPPORT_LT_20")
+            person_reasons.append("P_FEATURE_SUPPORT_LOW")
         if person.last_active_gap_days > cfg["max_last_active_gap_days"]:
             person_reasons.append("P_STALE")
     person_eval = _evaluation(ReferenceLevel.PERSON, person_reasons)
@@ -540,13 +542,13 @@ def select_sequence_reference(
         if not _support_is_past(person.support_as_of, day):
             person_reasons.append("SP_SUPPORT_NOT_PAST")
         if person.sequence_days < cfg["min_sequence_days"]:
-            person_reasons.append("SP_DAYS_LT_20")
+            person_reasons.append("SP_DAYS_LOW")
         if person.transitions < cfg["min_transitions"]:
-            person_reasons.append("SP_TRANS_LT_500")
+            person_reasons.append("SP_TRANSITIONS_LOW")
         if person.span_days < cfg["min_span_days"]:
-            person_reasons.append("SP_SPAN_LT_30")
+            person_reasons.append("SP_SPAN_DAYS_LOW")
         if person.sequence_days_current_role < cfg["min_role_sequence_days"]:
-            person_reasons.append("SP_ROLE_TENURE_LT_20")
+            person_reasons.append("SP_ROLE_TENURE_LOW")
         if person.last_active_gap_days > cfg["max_last_active_gap_days"]:
             person_reasons.append("SP_STALE")
     person_eval = _evaluation(ReferenceLevel.PERSON, person_reasons)

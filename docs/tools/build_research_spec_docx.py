@@ -306,10 +306,10 @@ def build_body() -> str:
         table(
             ["Branch/Level", "Điều kiện khởi tạo", "Kết quả khi thiếu"],
             [
-                ["Feature/Person", "≥30 active days; span ≥45; ≥30 ngày trong role hiện tại; coverage ≥0,90; stale ≤30", "Thử Feature/Role"],
+                ["Feature/Person", "≥60 active days; span ≥90; ≥60 ngày trong role hiện tại; coverage ≥0,90; mỗi feature đã dùng có ≥40 quan sát; stale ≤30", "Thử Feature/Role"],
                 ["Feature/Role", "Role known; peer users loại subject ≥15; peer user-days ≥300; recent support đủ", "Thử Feature/Global"],
                 ["Feature/Global", "Users ≥200; user-days ≥10.000; coverage ≥0,90; Train-only", "Feature NO_SCORE"],
-                ["Sequence/Person", "≥20 sequence-days; transitions ≥500; span ≥30; ≥20 ngày trong role; stale ≤30", "Thử Sequence/Role"],
+                ["Sequence/Person", "≥60 sequence-days; transitions ≥1.500; span ≥90; ≥60 ngày trong role; stale ≤30", "Thử Sequence/Role"],
                 ["Sequence/Role", "Role known; peer users ≥15; sequence-days ≥300; transitions ≥10.000", "Thử Sequence/Global"],
                 ["Sequence/Global", "Users ≥200; sequence-days ≥10.000; transitions ≥100.000; Train-only", "Sequence NO_SCORE"],
             ],
@@ -360,15 +360,18 @@ def build_body() -> str:
             ["State", "Điều kiện", "Hành động"],
             [
                 ["CANDIDATE", "User-day đã score bằng profile chưa chứa ngày D", "Đưa vào quarantine"],
-                ["REJECTED", "D có alert; lân cận có alert; vượt role/global p95; role epoch đổi", "Không cập nhật Person"],
+                ["REJECTED", "Có alert trong [D,D+30]; ROLE/GLOBAL parent CDF ≥0,90; role epoch đổi", "Không cập nhật Person"],
                 ["ACCEPTED", "Hết quarantine và không có reject reason", "Đủ điều kiện tạo profile version mới"],
                 ["APPLIED", "Profile mới ghi thành công và checksum hợp lệ", "Đóng version cũ; audit before/after"],
             ],
             [1450, 4600, 3310],
         ),
-        para("Quarantine mặc định 7 ngày và influence cap mặc định 0,05 là hyperparameter. Không "
-             "update in-place. Dev phải tạo immutable Person profile version mới để rollback và "
-             "tái lập. Thực nghiệm phải so frozen-person, immediate-update và safe-update."),
+        para("Safe-update dùng cửa sổ quarantine đóng [D,D+30]; ngày sớm nhất đủ điều kiện là "
+             "D+31. Incremental release bị giới hạn tối đa 2% mỗi release, cách nhau ít nhất 7 "
+             "ngày, và 10% trong cửa sổ rolling 30 ngày; bootstrap đủ support được miễn các cap "
+             "influence này. Không update in-place. Dev phải tạo immutable Person profile version "
+             "mới để rollback và tái lập. Thực nghiệm phải so frozen-person, immediate-update và "
+             "safe-update."),
 
         heading("10. Pipeline triển khai cho dev"),
         table(

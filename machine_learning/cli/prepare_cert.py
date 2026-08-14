@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
 
+from insider_ml.artifacts import atomic_write_json
 from insider_ml.cert_data import (
     LdapDirectory,
     build_prepared_days,
@@ -20,6 +22,14 @@ from insider_ml.cert_data import (
     select_users,
 )
 from insider_ml.contracts import TRAIN_START
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -123,6 +133,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "end_day": args.end_day.isoformat(),
         "history_window": f"[{history_start.isoformat()},{args.end_day.isoformat()}]",
         "users": list(users),
+        "selected_user_count": len(users),
+        "max_users": args.max_users,
         "events_retained": len(events),
         "raw_rows_read": rows_read,
         "samples": int(windows.feature_values.shape[0]),
@@ -135,15 +147,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "sequence_schema_version": str(windows.sequence_schema_version.item()),
         "preprocessing_checksum": str(windows.preprocessing_checksum.item()),
         "scaler_checksum": str(windows.scaler_checksum.item()),
+        "endpoint_policy": "ALL",
         "smoke_row_cap_per_source": args.max_rows_per_source,
         "output": str(args.output.resolve()),
+        "output_sha256": _sha256(args.output),
     }
     manifest_path = args.manifest or args.output.with_suffix(args.output.suffix + ".manifest.json")
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(manifest_path, manifest)
     return manifest
 
 

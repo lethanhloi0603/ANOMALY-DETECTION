@@ -54,11 +54,11 @@ def test_employee_day_universe_keeps_zero_event_days_and_effective_bounds() -> N
 def feature_person(**changes):
     values = {
         "support_as_of": AS_OF,
-        "active_days": 30,
-        "span_days": 45,
-        "active_days_current_role": 30,
+        "active_days": 60,
+        "span_days": 90,
+        "active_days_current_role": 60,
         "coverage": 0.90,
-        "min_feature_observations": 20,
+        "min_feature_observations": 40,
         "last_active_gap_days": 30,
     }
     values.update(changes)
@@ -94,10 +94,10 @@ def feature_global(**changes):
 def sequence_person(**changes):
     values = {
         "support_as_of": AS_OF,
-        "sequence_days": 20,
-        "transitions": 500,
-        "span_days": 30,
-        "sequence_days_current_role": 20,
+        "sequence_days": 60,
+        "transitions": 1_500,
+        "span_days": 90,
+        "sequence_days_current_role": 60,
         "last_active_gap_days": 30,
     }
     values.update(changes)
@@ -148,11 +148,11 @@ def test_feature_person_fails_then_role_is_selected_with_all_reasons_in_order():
     decision = select_feature_reference(
         score_date=SCORE_DATE,
         person=feature_person(
-            active_days=29,
-            span_days=44,
-            active_days_current_role=29,
+            active_days=59,
+            span_days=89,
+            active_days_current_role=59,
             coverage=0.89,
-            min_feature_observations=19,
+            min_feature_observations=39,
             last_active_gap_days=31,
         ),
         role=feature_role(),
@@ -161,11 +161,11 @@ def test_feature_person_fails_then_role_is_selected_with_all_reasons_in_order():
 
     assert decision.selected_level is ReferenceLevel.ROLE
     assert decision.reason_codes == (
-        "P_ACTIVE_DAYS_LT_30",
-        "P_SPAN_LT_45",
-        "P_ROLE_TENURE_LT_30",
+        "P_ACTIVE_DAYS_LOW",
+        "P_SPAN_DAYS_LOW",
+        "P_ROLE_TENURE_LOW",
         "P_COVERAGE_LOW",
-        "P_FEATURE_SUPPORT_LT_20",
+        "P_FEATURE_SUPPORT_LOW",
         "P_STALE",
     )
 
@@ -236,7 +236,7 @@ def test_support_as_of_must_be_strictly_before_score_date():
 
 
 def test_feature_configuration_override_is_loaded_from_json(tmp_path):
-    config_path = tmp_path / "framework.v4.json"
+    config_path = tmp_path / "framework.v5.json"
     config_path.write_text(
         json.dumps(
             {
@@ -260,12 +260,12 @@ def test_feature_configuration_override_is_loaded_from_json(tmp_path):
     )
 
     assert decision.selected_level is ReferenceLevel.ROLE
-    assert decision.reason_codes == ("P_ACTIVE_DAYS_LT_30",)
+    assert decision.reason_codes == ("P_ACTIVE_DAYS_LOW",)
     assert decision.config_version == "test.v2"
 
 
 def test_repository_config_aliases_are_honored(tmp_path):
-    config_path = tmp_path / "framework.v4.json"
+    config_path = tmp_path / "framework.v5.json"
     config_path.write_text(
         json.dumps(
             {
@@ -321,13 +321,13 @@ def test_repository_config_aliases_are_honored(tmp_path):
 
     assert feature_decision.selected_level is ReferenceLevel.ROLE
     assert feature_decision.reason_codes == (
-        "P_ROLE_TENURE_LT_30",
+        "P_ROLE_TENURE_LOW",
         "P_COVERAGE_LOW",
     )
     assert feature_decision.config_version == "alias.v1"
     assert sequence_decision.selected_level is ReferenceLevel.ROLE
     assert sequence_decision.reason_codes == (
-        "SP_ROLE_TENURE_LT_20",
+        "SP_ROLE_TENURE_LOW",
         "SP_STALE",
     )
     assert fusion.risk == pytest.approx(0.65)
@@ -337,7 +337,7 @@ def test_repository_config_aliases_are_honored(tmp_path):
 def test_missing_config_path_uses_framework_defaults(tmp_path):
     config = load_framework_config(tmp_path / "does-not-exist.json")
 
-    assert config["version"] == "framework.v4"
+    assert config["version"] == "framework.v5"
     assert config["readiness"]["sequence"]["current_day"]["min_seq_len"] == 2
 
 
@@ -375,10 +375,10 @@ def test_sequence_person_fails_then_role_is_selected_deterministically():
         seq_len=2,
         person=sequence_person(
             support_as_of=SCORE_DATE,
-            sequence_days=19,
-            transitions=499,
-            span_days=29,
-            sequence_days_current_role=19,
+            sequence_days=59,
+            transitions=1_499,
+            span_days=89,
+            sequence_days_current_role=59,
             last_active_gap_days=31,
         ),
         role=sequence_role(),
@@ -388,10 +388,10 @@ def test_sequence_person_fails_then_role_is_selected_deterministically():
     assert decision.selected_level is ReferenceLevel.ROLE
     assert decision.reason_codes == (
         "SP_SUPPORT_NOT_PAST",
-        "SP_DAYS_LT_20",
-        "SP_TRANS_LT_500",
-        "SP_SPAN_LT_30",
-        "SP_ROLE_TENURE_LT_20",
+        "SP_DAYS_LOW",
+        "SP_TRANSITIONS_LOW",
+        "SP_SPAN_DAYS_LOW",
+        "SP_ROLE_TENURE_LOW",
         "SP_STALE",
     )
 
